@@ -1,0 +1,30 @@
+# 导出的邮件与运行产物（含个人数据，绝不入库）
+eml/
+logs/
+index.csv
+state.json
+report.md
+verify-report.md
+*.log
+
+# 从规范生成的中间文件（可用 tools/fetch_ms-aswbxml_spec.py 重新生成）
+refs/
+
+# Python
+__pycache__/
+*.py[cod]
+.tmp-test/
+.venv/
+venv/
+env/
+
+# 打包
+build/
+dist/
+*.spec
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
