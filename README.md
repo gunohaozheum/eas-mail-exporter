@@ -3,6 +3,12 @@
 把整个邮箱导出成本地 `.eml` 文件：走 **Exchange ActiveSync**（手机邮件客户端用的那条通道），
 不需要 Outlook，也不依赖任何第三方库。提供图形界面和命令行两种用法。
 
+![GUI 界面](docs/screenshot.png)
+
+[![tests](https://github.com/gunohaozheum/eas-mail-exporter/actions/workflows/tests.yml/badge.svg)](https://github.com/gunohaozheum/eas-mail-exporter/actions/workflows/tests.yml)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 [English](#english) | [中文](#中文说明)
 
 ---

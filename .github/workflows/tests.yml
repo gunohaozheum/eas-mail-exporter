@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  offline-tests:
+    name: offline tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Syntax check
+        run: python -m py_compile cli.py app_gui.pyw eas/*.py tools/*.py tests/*.py
+
+      - name: CLI smoke test
+        run: python cli.py --help
+
+      - name: WBXML codec (matches Microsoft's byte-level example)
+        run: python tests/test_wbxml.py
+
+      - name: Request encoding
+        run: python tests/test_requests.py
+
+      - name: Response parsing
+        run: python tests/test_responses.py
+
+      - name: Header decoding
+        run: python tests/test_headers.py
+
+      - name: Export engine internals
+        run: python tests/test_engine.py

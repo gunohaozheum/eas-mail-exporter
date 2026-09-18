@@ -177,8 +177,11 @@ class ExportApp(tk.Tk):
 
     def load_config(self) -> None:
         try:
-            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        except Exception:
+            # utf-8-sig：用记事本等编辑器保存过的配置文件可能带 BOM
+            config = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            if CONFIG_FILE.exists():
+                logging.warning("配置文件读取失败，改用默认值：%s", exc)
             return
         self.var_url.set(config.get("url", self.var_url.get()))
         self.var_user.set(config.get("user", self.var_user.get()))
