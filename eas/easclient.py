@@ -754,6 +754,12 @@ class EasClient:
         if root is None:
             raise EasError("FolderSync 返回空响应体，请重试")
         folders, new_key, deleted = parse_folder_sync(root)
+        if not folders:
+            # 这是最需要证据的场景：明确把服务器实际返回的结构打进日志
+            LOGGER.warning(
+                "FolderSync 返回了 0 个文件夹。服务器原始响应结构：\n%s",
+                wbxml.summarize(root, max_depth=4),
+            )
         LOGGER.info(
             "FolderSync 返回 %d 个文件夹（SyncKey %s → %s%s）",
             len(folders),

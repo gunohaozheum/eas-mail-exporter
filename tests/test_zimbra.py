@@ -19,8 +19,11 @@ from eas import wbxml  # noqa: E402
 from eas.easclient import EasClient, HttpResponse, NotEasResponse  # noqa: E402
 from eas.exporter import ExportSettings, create_engine  # noqa: E402
 from eas.wbxml import FolderHierarchy, E  # noqa: E402
+from eas.easclient import EasError  # noqa: E402
 from eas.zimbra import (  # noqa: E402
+    ZimbraAuthError,
     ZimbraClient,
+    ZimbraError,
     ZimbraFolder,
     extract_messages,
     is_eas_url,
@@ -47,9 +50,10 @@ MAIL_2 = (
 class FakeTransport:
     """按 URL/请求体路由的假传输层。"""
 
-    def __init__(self, handler, downloads=None) -> None:
+    def __init__(self, handler, downloads=None, download_error=None) -> None:
         self.handler = handler
         self.downloads = downloads or {}
+        self.download_error = download_error
         self.calls: list[tuple[str, str]] = []
 
     def request(self, method, url, *, headers=None, body=None, timeout=300.0):
@@ -58,6 +62,8 @@ class FakeTransport:
 
     def download(self, url, dest, *, headers=None, timeout=900.0, progress=None, chunk_size=1 << 18):
         self.calls.append(("DOWNLOAD", url))
+        if self.download_error is not None:
+            raise self.download_error
         for needle, payload in self.downloads.items():
             if needle in url:
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -89,7 +95,7 @@ FOLDER_PAYLOAD = {
                 {
                     "name": "Projects",
                     "view": "message",
-                    "n": 1,
+                    "n": 0,  # 邮件在子文件夹里，父文件夹本身为 0
                     "folder": [{"name": "2026", "view": "message", "n": 1}],
                 },
             ]
@@ -168,6 +174,81 @@ def test_zimbra_folder_url_encoding() -> None:
     assert url.startswith("https://mail.example.edu.cn/home/u@example.edu.cn/Projects/2026%20")
     assert "%E5%B9%B4%E5%BA%A6" in url
     assert url.endswith("?fmt=tgz")
+
+
+# ------------------------------------------------------------- SOAP 错误处理
+
+# 真实抓到的响应形状：Zimbra 把 SOAP 错误放在 HTTP 500 + JSON body 里
+SOAP_AUTH_FAULT = json.dumps(
+    {
+        "Header": {"context": {"_jsns": "urn:zimbra"}},
+        "Body": {
+            "Fault": {
+                "Code": {"Value": "soap:Sender"},
+                "Reason": {"Text": "authentication failed for [nobody@example.edu.cn]"},
+                "Detail": {"Error": {"Code": "account.AUTH_FAILED"}},
+            }
+        },
+        "_jsns": "urn:zimbraSoap",
+    }
+).encode()
+
+
+def test_soap_auth_fault_is_friendly() -> None:
+    """HTTP 500 + AUTH_FAILED 要报成"账号或密码没被接受"，而不是原始 JSON。"""
+    client = ZimbraClient("https://mail.example.edu.cn", "nobody@example.edu.cn", "x")
+    client.transport = FakeTransport(
+        lambda m, u, b: HttpResponse(500, {"Content-Type": "text/javascript"}, SOAP_AUTH_FAULT)
+    )
+    try:
+        client.login()
+    except ZimbraAuthError as exc:
+        message = str(exc)
+        assert "认证失败" in message
+        assert "account.AUTH_FAILED" in message
+        assert "统一身份认证" in message  # 给出 SSO 场景的提示
+        return
+    raise AssertionError("应当抛出 ZimbraAuthError")
+
+
+def test_soap_http_error_without_json() -> None:
+    client = ZimbraClient("https://mail.example.edu.cn", "u@example.edu.cn", "x")
+    client.transport = FakeTransport(
+        lambda m, u, b: HttpResponse(500, {"Content-Type": "text/html"}, b"<html>boom</html>")
+    )
+    try:
+        client.login()
+    except ZimbraError as exc:
+        assert "HTTP 500" in str(exc) and "boom" in str(exc)
+        return
+    raise AssertionError("应当抛出 ZimbraError")
+
+
+def test_missing_folders_are_skipped() -> None:
+    """SOAP 列不出文件夹（退回默认名）+ 每个文件夹都 404 时，不能报错崩掉。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "missing"
+    settings = ExportSettings(
+        server_url="https://mail.example.edu.cn",
+        user="u@example.edu.cn",
+        out_dir=out_dir,
+        backend="zimbra",
+    )
+    engine = create_engine(settings, "pw")
+    engine.client = ZimbraClient(settings.server_url, settings.user, "pw")
+    # SOAP 不可用 → 退回默认文件夹名；下载全部 404 → 全部跳过
+    engine.client.transport = FakeTransport(
+        lambda m, u, b: HttpResponse(500, {"Content-Type": "text/html"}, b"<html>no soap</html>"),
+        download_error=EasError("下载返回 HTTP 404：https://mail.example.edu.cn/home/u@example.edu.cn/Inbox?fmt=tgz"),
+    )
+    try:
+        summary = engine.run()
+        assert summary["exported"] == 0
+        assert engine.stats, "应当为每个尝试过的文件夹留下记录"
+        assert all(info.get("missing") for info in engine.stats.values()), engine.stats
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ 端到端
@@ -332,6 +413,12 @@ if __name__ == "__main__":
     print("文件夹自动发现        ✓")
     test_zimbra_folder_url_encoding()
     print("文件夹 URL 编码       ✓")
+    test_soap_auth_fault_is_friendly()
+    print("SOAP 认证错误提示      ✓")
+    test_soap_http_error_without_json()
+    print("SOAP 非 JSON 错误      ✓")
+    test_missing_folders_are_skipped()
+    print("文件夹不存在自动跳过   ✓")
     test_options_html_is_reported_clearly()
     print("OPTIONS 返回网页      ✓（明确报错）")
     test_protocol_request_html_is_reported_clearly()

@@ -246,14 +246,14 @@ class ExportApp(tk.Tk):
         # 导出目录里的日志文件在每次开始时再挂
         self.file_handler: logging.FileHandler | None = None
 
-    def _attach_file_log(self, out_dir: Path) -> None:
+    def _attach_file_log(self, out_dir: Path, prefix: str = "export") -> None:
         if self.file_handler is not None:
             logging.getLogger().removeHandler(self.file_handler)
             self.file_handler.close()
         try:
             log_dir = out_dir / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
-            path = log_dir / f"export-{time.strftime('%Y%m%d-%H%M%S')}.log"
+            path = log_dir / f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}.log"
             handler = logging.FileHandler(path, encoding="utf-8")
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
             logging.getLogger().addHandler(handler)
@@ -313,15 +313,27 @@ class ExportApp(tk.Tk):
         if out_dir is None:
             return
         self.save_config()
+        self._attach_file_log(out_dir, prefix="probe")
         self._set_running(True)
         self.var_status.set("正在测试连接…")
         engine = create_engine(self._settings(out_dir), self.var_password.get(), progress=self._on_event)
 
         def work() -> None:
             try:
-                engine.probe()
-                self.events.put(("log", "INFO", "探测完成（详情见上方日志）"))
-                self.events.put(("status", "测试完成"))
+                result = engine.probe()
+                count = None
+                if isinstance(result, tuple):
+                    count = len(result[0])
+                elif isinstance(result, list):
+                    count = len(result)
+                if count is None:
+                    self.events.put(("status", "测试完成"))
+                elif count == 0:
+                    self.events.put(("log", "WARNING", "探测完成：服务器返回 0 个文件夹，请把上面的日志发我排查"))
+                    self.events.put(("status", "测试完成：0 个文件夹"))
+                else:
+                    self.events.put(("log", "INFO", f"探测完成：共 {count} 个文件夹（详情见上方日志）"))
+                    self.events.put(("status", f"测试完成：{count} 个文件夹"))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
             finally:

@@ -40,6 +40,10 @@ class ZimbraAuthError(ZimbraError):
     """Zimbra 认证失败。"""
 
 
+class ZimbraFolderMissing(ZimbraError):
+    """服务器上没有这个文件夹（默认文件夹名在本地化部署里可能不适用）。"""
+
+
 @dataclass
 class ZimbraFolder:
     path: str  # 例如 "Inbox" 或 "Inbox/子文件夹"
@@ -152,21 +156,42 @@ class ZimbraClient:
             timeout=self.timeout,
         )
         if response.status_code == 401:
-            raise ZimbraAuthError("认证失败（HTTP 401）：账号或密码没被接受。")
-        if response.status_code != 200:
-            raise ZimbraError(f"SOAP 返回 HTTP {response.status_code}：{response.content[:200]!r}")
+            raise ZimbraAuthError(
+                f"认证失败（HTTP 401）：账号 {self.user!r} 或密码没被接受。"
+                "如果网页端走的是统一身份认证（SSO），邮箱可能需要单独的客户端密码。"
+            )
+
+        # 注意：Zimbra 把 SOAP 错误放在 HTTP 500 + JSON body 里，
+        # 所以必须先尝试解析 body，再看状态码。
+        parse_error: Exception | None = None
         try:
             data = json.loads(response.content.decode("utf-8", "replace"))
         except Exception as exc:
-            raise ZimbraError(f"SOAP 响应无法解析为 JSON：{exc}") from exc
+            data = None
+            parse_error = exc
+        if data is None:
+            if response.status_code != 200:
+                preview = " ".join(response.content[:200].decode("utf-8", "replace").split())
+                raise ZimbraError(
+                    f"SOAP 返回 HTTP {response.status_code}，且响应不是 JSON"
+                    f"（Content-Type: {response.header('Content-Type') or '未提供'}）：{preview!r}"
+                )
+            raise ZimbraError(f"SOAP 响应无法解析为 JSON：{parse_error}") from parse_error
+
         body_out = data.get("Body") or {}
         if "Fault" in body_out:
             fault = body_out["Fault"]
             reason = (fault.get("Reason") or {}).get("Text") or fault
             code = (fault.get("Detail") or {}).get("Error", {}).get("Code")
             if code in ("account.AUTH_FAILED", "service.AUTH_REQUIRED", "service.AUTH_EXPIRED"):
-                raise ZimbraAuthError(f"认证失败：{reason}")
-            raise ZimbraError(f"SOAP 返回错误：{reason}")
+                raise ZimbraAuthError(
+                    f"认证失败：{reason}（{code}）。"
+                    "请确认用户名是完整邮箱地址、密码可在邮件网页端登录；"
+                    "若网页端用统一身份认证（SSO）登录，邮箱可能需要单独设置客户端密码。"
+                )
+            raise ZimbraError(f"SOAP 返回错误：{reason}（{code or '未知错误码'}）")
+        if response.status_code != 200:
+            raise ZimbraError(f"SOAP 返回 HTTP {response.status_code}：{response.content[:200]!r}")
         return body_out
 
     def login(self) -> str:
@@ -247,4 +272,11 @@ class ZimbraClient:
                 progress=progress,
             )
         except EasError as exc:
-            raise ZimbraError(str(exc)) from exc
+            message = str(exc)
+            if "HTTP 401" in message:
+                raise ZimbraAuthError(
+                    f"下载文件夹时认证被拒（HTTP 401）：账号 {self.user!r} 或密码没被接受。"
+                ) from exc
+            if "HTTP 404" in message:
+                raise ZimbraFolderMissing(f"服务器上没有这个文件夹：{folder_path}") from exc
+            raise ZimbraError(message) from exc

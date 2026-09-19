@@ -41,6 +41,7 @@ from .zimbra import (
     ZimbraClient,
     ZimbraError,
     ZimbraFolder,
+    ZimbraFolderMissing,
     extract_messages,
     is_eas_url,
     parse_server_url,
@@ -336,6 +337,23 @@ class BaseExportEngine:
         report.write_text("\n".join(lines), encoding="utf-8")
         return report
 
+    def log_empty_result(self, summary: dict) -> None:
+        """一封都没导出时，把可能的原因直接说清楚，省得对着日志猜。"""
+        if summary.get("exported_now"):
+            return
+        already = sum(1 for entry in self.state.folders.values() if entry.get("exported"))
+        if already:
+            LOGGER.info(
+                "本次没有新增邮件：这个导出目录的 state.json 里已经有 %d 个文件夹的导出记录，"
+                "所以全部被跳过了。想重新完整导出，请换一个导出目录，或删掉该目录下的 state.json。",
+                already,
+            )
+        else:
+            LOGGER.warning(
+                "本次没有导出任何邮件。请回看上面的日志：服务器是否返回了文件夹？"
+                "通道和账号是否正确？"
+            )
+
 
 # --------------------------------------------------------------------- EAS 通道
 
@@ -430,6 +448,11 @@ class ExportEngine(BaseExportEngine):
         skipped = [folder for folder in folders if folder not in targets]
         if skipped:
             LOGGER.info("跳过 %d 个非邮件文件夹（日历/联系人/任务等）", len(skipped))
+        if not targets:
+            LOGGER.warning(
+                "没有找到任何邮件文件夹（服务器共返回 %d 个文件夹）。账号、通道或服务器设置可能不对。",
+                len(folders),
+            )
         LOGGER.info("准备导出 %d 个邮件文件夹", len(targets))
         self._emit(event="folders", total=len(targets), names=[paths[f.server_id] for f in targets])
 
@@ -456,6 +479,7 @@ class ExportEngine(BaseExportEngine):
         self.index.flush()
         self.state.save(self.client)
         summary = self.build_summary(started)
+        self.log_empty_result(summary)
         self.write_report()
         self._emit(event="done", stats=summary)
         return summary
@@ -659,6 +683,8 @@ class ZimbraExportEngine(BaseExportEngine):
         if settings.only:
             needles = [needle.lower() for needle in settings.only]
             folders = [f for f in folders if any(n in f.path.lower() for n in needles)]
+        if not folders:
+            LOGGER.warning("没有可导出的文件夹，请检查账号、通道和服务器设置。")
         LOGGER.info("准备导出 %d 个邮件文件夹", len(folders))
         self._emit(event="folders", total=len(folders), names=[f.path for f in folders])
 
@@ -686,6 +712,7 @@ class ZimbraExportEngine(BaseExportEngine):
         self.index.flush()
         self.state.save()
         summary = self.build_summary(started)
+        self.log_empty_result(summary)
         self.write_report()
         self._emit(event="done", stats=summary)
         return summary
@@ -721,6 +748,15 @@ class ZimbraExportEngine(BaseExportEngine):
             LOGGER.info("    已下载 %s（%.1f MB）", archive.name, size / 1048576)
         except ZimbraAuthError:
             raise
+        except ZimbraFolderMissing as exc:
+            # 默认文件夹名在本地化部署里可能不适用，这类"没有这个文件夹"跳过即可
+            LOGGER.info("    %s：跳过（%s）", folder.path, exc)
+            self.stats[folder.path] = {
+                "exported_total": len(exported), "exported_now": 0, "fetched_individually": 0,
+                "failed": 0, "seconds": round(time.time() - started, 1), "missing": True,
+            }
+            self._emit(event="folder_done", folder=folder.path, stats=self.stats[folder.path])
+            return
         except ZimbraError as exc:
             if folder.total == 0:
                 LOGGER.info("    %s：服务器报告为空文件夹，跳过（%s）", folder.path, exc)
