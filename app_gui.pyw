@@ -62,7 +62,7 @@ class ExportApp(tk.Tk):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry("920x800")
-        self.minsize(800, 700)
+        self.minsize(760, 480)   # 内容可滚动，窗口可以缩小
 
         self.events: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
@@ -106,8 +106,32 @@ class ExportApp(tk.Tk):
     # ------------------------------------------------------------- 界面
 
     def _build_widgets(self) -> None:
-        outer = ttk.Frame(self, padding=12)
-        outer.pack(fill="both", expand=True)
+        # 状态栏固定在底部：必须先 pack，否则会被下面 expand 的区域挤掉
+        self.status_bar = ttk.Label(
+            self, textvariable=self.var_status, relief="sunken", anchor="w", padding=(8, 4)
+        )
+        self.status_bar.pack(fill="x", side="bottom")
+
+        # 其余内容放进带垂直滚动条的画布，窗口变小时也能看到全部内容
+        container = ttk.Frame(self)
+        container.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        outer = ttk.Frame(self.canvas, padding=12)
+        window_id = self.canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(window_id, width=event.width),
+        )
+        self.bind_all("<MouseWheel>", self._on_mousewheel)
 
         form = ttk.LabelFrame(outer, text="连接信息", padding=10)
         form.pack(fill="x")
@@ -220,8 +244,15 @@ class ExportApp(tk.Tk):
         self.log.tag_configure("ERROR", foreground="#c0392b")
         self.log.tag_configure("DEBUG", foreground="#888")
 
-        status_bar = ttk.Label(self, textvariable=self.var_status, relief="sunken", anchor="w", padding=(8, 4))
-        status_bar.pack(fill="x", side="bottom")
+    def _on_mousewheel(self, event) -> None:
+        """滚轮滚动整个窗口；鼠标停在日志/列表上时交给它们自己滚。"""
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, (tk.Text, tk.Listbox, ttk.Scrollbar, ttk.Combobox)):
+            return
+        try:
+            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------- 配置读写
 

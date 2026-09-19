@@ -159,6 +159,46 @@ def test_mbox_button_builds_file() -> bool:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_window_scrolls_and_status_bar_stays() -> bool:
+    """内容区可垂直滚动，状态栏固定在底部（不被挤掉）。"""
+    if not has_gui():
+        print("（没有可用的图形环境，跳过）")
+        return False
+    module = _load_app_module()
+    if module is None:
+        print("（无法加载 app_gui.pyw，跳过）")
+        return False
+
+    app = None
+    try:
+        app = module.ExportApp()
+        app.withdraw()
+        # 把窗口缩到很小，模拟小屏幕
+        app.geometry("780x500")
+        app.update_idletasks()
+        app.update()
+
+        canvas = app.canvas
+        region = canvas.bbox("all")
+        assert region and region[3] > 0, f"画布没有滚动区域：{region}"
+        before = canvas.yview()
+        canvas.yview_moveto(1.0)
+        app.update()
+        after = canvas.yview()
+        assert after != before, f"画布无法滚动：{before} -> {after}"
+        assert canvas.bbox("all")[3] > 500, "内容高度应超过窗口高度才需要滚动"
+
+        # 状态栏固定在底部且没有被 expand 的区域挤掉
+        assert app.status_bar.pack_info().get("side") == "bottom"
+        assert app.status_bar.winfo_reqheight() > 1
+        assert app.status_bar.cget("textvariable") == str(app.var_status)
+        return True
+    finally:
+        if app is not None:
+            app.destroy()
+        logging.getLogger().handlers = [logging.NullHandler()]
+
+
 if __name__ == "__main__":
     ran = test_probe_shows_feedback()
     if ran:
@@ -166,3 +206,6 @@ if __name__ == "__main__":
     ran = test_mbox_button_builds_file()
     if ran:
         print("GUI 生成 mbox        ✓")
+    ran = test_window_scrolls_and_status_bar_stays()
+    if ran:
+        print("窗口可滚动/状态栏     ✓")
