@@ -11,7 +11,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from eas.easclient import Folder  # noqa: E402
-from eas.exporter import Index, State, eml_basename, folder_paths, safe_name  # noqa: E402
+from eas.exporter import (  # noqa: E402
+    ExportEngine,
+    ExportSettings,
+    Index,
+    State,
+    eml_basename,
+    folder_paths,
+    safe_name,
+)
 
 
 def test_safe_name() -> None:
@@ -82,6 +90,34 @@ def test_state_and_index() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_state_matches_disk() -> None:
+    """状态记录与磁盘文件对不上时要能识别出来（否则会静默漏掉邮件）。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        settings = ExportSettings(
+            server_url="https://mail.example.com", user="u@example.com", out_dir=tmp_dir
+        )
+        engine = ExportEngine(settings, "pw")
+        entry = {"exported": ["1", "2"], "sync_key": "5"}
+
+        # 目录根本不存在
+        assert engine.state_matches_disk("Inbox", entry) is False
+        # 只有一个文件，但记录说导出过 2 封
+        folder = tmp_dir / "eml" / "Inbox"
+        folder.mkdir(parents=True)
+        (folder / "a.eml").write_bytes(b"x")
+        assert engine.state_matches_disk("Inbox", entry) is False
+        # 文件数对上
+        (folder / "b.eml").write_bytes(b"x")
+        assert engine.state_matches_disk("Inbox", entry) is True
+        # 没有导出记录时不需要检查
+        assert engine.state_matches_disk("Inbox", {"exported": []}) is True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_safe_name()
     print("文件名净化          ✓")
@@ -91,4 +127,6 @@ if __name__ == "__main__":
     print("文件夹路径          ✓")
     test_state_and_index()
     print("状态与索引          ✓")
+    test_state_matches_disk()
+    print("状态与磁盘一致性    ✓")
 

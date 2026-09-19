@@ -354,6 +354,28 @@ class BaseExportEngine:
                 "通道和账号是否正确？"
             )
 
+    def state_matches_disk(self, folder_path: str, entry: dict) -> bool:
+        """检查 state 记录的"已导出"与磁盘上的文件是否对得上。
+
+        如果状态说导出过 N 封、目录里却只剩更少的文件（被手动删掉/移走、
+        或换了机器），就判定为不同步，让调用方把该文件夹重置后重新同步。
+        """
+        exported = entry.get("exported") or []
+        if not exported:
+            return True
+        directory = self.out_dir / "eml" / folder_path
+        on_disk = len(list(directory.glob("*.eml"))) if directory.exists() else 0
+        if on_disk >= len(exported):
+            return True
+        LOGGER.warning(
+            "%s：状态里记着已导出 %d 封，但目录里只有 %d 个文件（可能被移动或删除），"
+            "将重新同步这个文件夹。",
+            folder_path,
+            len(exported),
+            on_disk,
+        )
+        return False
+
 
 # --------------------------------------------------------------------- EAS 通道
 
@@ -492,6 +514,13 @@ class ExportEngine(BaseExportEngine):
         entry = self.state.folder(folder.server_id, name=name, type_code=folder.type_code)
         exported: set[str] = set(entry["exported"])
         sync_key = entry.get("sync_key") or "0"
+        if not self.state_matches_disk(name, entry):
+            # 状态与磁盘不一致：清掉该文件夹的记录，从 SyncKey=0 重新完整同步
+            entry["exported"] = []
+            exported = set()
+            sync_key = "0"
+            entry["sync_key"] = "0"
+            self.state.save(self.client)
         LOGGER.info("→ %s（已有 %d 封，SyncKey=%s）", name, len(exported), sync_key)
 
         seen = 0
@@ -725,6 +754,10 @@ class ZimbraExportEngine(BaseExportEngine):
         key = f"zimbra:{folder.path}"
         entry = self.state.folder(key, name=folder.path)
         exported: set[str] = set(entry["exported"])
+        if not self.state_matches_disk(folder.path, entry):
+            entry["exported"] = []
+            exported = set()
+            self.state.save()
         cache_dir = self.out_dir / ".zimbra-cache"
         archive = cache_dir / f"{safe_name(folder.path.replace('/', '_'), 60)}.tgz"
         started = time.time()
