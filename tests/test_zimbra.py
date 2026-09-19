@@ -404,6 +404,44 @@ def test_auto_falls_back_to_zimbra() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_auto_does_not_fall_back_on_exchange_auth_error() -> None:
+    """Exchange 端点的 401 就是密码问题，不该再拿同一套密码去试 Zimbra。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    settings = ExportSettings(
+        server_url="https://mail.example.com",
+        user="DOMAIN\\someone",
+        out_dir=tmp_dir / "auth",
+        backend="auto",
+    )
+    engine = create_engine(settings, "wrong-password")
+    from eas import exporter as exporter_module
+
+    from eas.easclient import EasAuthError
+
+    def eas_factory(url, user, password, **kwargs):
+        client = EasClient(url, user, password)
+        client.transport = FakeTransport(
+            lambda m, u, b: HttpResponse(
+                401, {"WWW-Authenticate": 'Basic realm="mail.example.com"', "X-FEServer": "MAIL01"}, b""
+            )
+        )
+        return client
+
+    exporter_module.ExportEngine.client_factory = staticmethod(eas_factory)
+    try:
+        engine.run()
+    except EasAuthError as exc:
+        assert "认证失败" in str(exc)
+        assert "Exchange" in str(exc)   # 提示服务器类型，便于判断
+        assert "改过密码" in str(exc)
+        return
+    finally:
+        exporter_module.ExportEngine.client_factory = staticmethod(EasClient)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    raise AssertionError("应当直接抛出认证失败，而不是回退到 Zimbra")
+
+
 if __name__ == "__main__":
     test_parse_server_url()
     print("服务器地址推导        ✓")
@@ -429,3 +467,5 @@ if __name__ == "__main__":
     print("Zimbra 端到端导出     ✓")
     test_auto_falls_back_to_zimbra()
     print("自动回退到 Zimbra     ✓")
+    test_auto_does_not_fall_back_on_exchange_auth_error()
+    print("认证失败不回退         ✓")

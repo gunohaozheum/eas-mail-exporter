@@ -93,6 +93,11 @@ usual symptom of "mobile sync is not enabled for this account" — the tool now
 says exactly that (HTTP status, content type, first bytes) instead of failing
 with a parse error, and `auto` mode moves on to the Zimbra channel.
 
+`auto` only switches channels when the server answers in a non-ActiveSync way, or
+when the endpoint identifies itself as Zimbra (`realm="Zimbra"`). An
+authentication failure (HTTP 401) is reported as such instead of being retried
+against Zimbra with the same wrong password — that only buries the real error.
+
 ### Output layout
 
 ```
@@ -234,6 +239,10 @@ Zimbra 通道会把每个邮件文件夹整包下载成 `tar.gz`（里面是一�
 如果服务器用网页而不是 WBXML 回应 ActiveSync 请求——这正是"该账号没启用移动同步"的典型
 表现——工具现在会直接说清楚（HTTP 状态码、Content-Type、响应开头字节），而不是抛一个看不懂
 的解析错误；`auto` 模式下还会自动改走 Zimbra 通道。
+
+`auto` 只在两种情况下换通道：服务器不是按 ActiveSync 协议应答，或者端点自报是 Zimbra
+（认证挑战里带 `realm="Zimbra"`）。如果只是**认证失败（HTTP 401）**，会直接把错误抛出来，
+不会拿同一套错误密码再去试 Zimbra——那样只会把真正的问题埋掉。
 
 ### 输出结构
 

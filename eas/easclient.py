@@ -500,6 +500,8 @@ class EasClient:
         self.transport = HttpTransport(verify_tls=verify_tls)
         self.server_versions: list[str] = []
         self.server_commands: list[str] = []
+        # 服务器类型线索：从认证挑战/响应头推断（Zimbra 与 Exchange 的提示不同）
+        self.server_hint: str | None = None
 
         import base64
 
@@ -574,8 +576,31 @@ class EasClient:
             key = response.header("X-MS-PolicyKey")
             if capture_policy_header and key and key != self.policy_key:
                 self.policy_key = key
+            self._note_server_hint(response)
             return response
         raise EasError(f"{cmd} 请求失败：{last_error}")
+
+    def _note_server_hint(self, response: HttpResponse) -> None:
+        """从响应头判断对面是 Zimbra 还是 Exchange（用于决定要不要换通道）。"""
+        challenge = response.header("WWW-Authenticate").lower()
+        if "zimbra" in challenge:
+            self.server_hint = "zimbra"
+        elif "realm=" in challenge or response.header("X-FEServer"):
+            self.server_hint = "exchange"
+
+    def _auth_error(self, where: str) -> EasAuthError:
+        """认证失败时给出可操作的建议，而不是只有一句 401。"""
+        server = {
+            "zimbra": "Zimbra",
+            "exchange": "Exchange（服务器提供了 Basic 认证，说明基础认证本身是可用的）",
+        }.get(self.server_hint or "", "未知类型")
+        return EasAuthError(
+            f"认证失败（{where}，HTTP 401）：账号 {self.user!r} 没被接受。\n"
+            f"服务器类型：{server}\n"
+            "请检查：1) 密码是否输入正确、近期是否改过密码；"
+            "2) 账号写法是否正确（邮箱地址 或 域\\\\用户名 两种形式）；"
+            "3) 若服务器启用了二次验证或统一身份认证（SSO），邮箱可能需要单独的客户端密码。"
+        )
 
     def call(self, cmd: str, root: wbxml.Node | None = None, *, provision_retry: bool = True):
         """发命令并解析 WBXML 响应；返回 None 表示服务器回了空响应体。"""
@@ -583,10 +608,7 @@ class EasClient:
         response = self.request(cmd, body)
 
         if response.status_code == 401:
-            raise EasAuthError(
-                f"认证失败（HTTP 401）：账号 {self.user!r} 没被接受。"
-                "如果账号是邮箱地址形式，可以试试 域\\用户名。"
-            )
+            raise self._auth_error(cmd)
         if response.status_code == 449 and provision_retry:
             LOGGER.info("%s 需要设备策略（HTTP 449），先走 Provision 流程", cmd)
             self.provision(response)
@@ -628,7 +650,7 @@ class EasClient:
         if response.status_code == 400:
             response = self.request("Options", None, method="OPTIONS", with_params=False)
         if response.status_code == 401:
-            raise EasAuthError(f"认证失败（HTTP 401）：账号 {self.user!r} 没被接受。")
+            raise self._auth_error("OPTIONS")
         if response.status_code != 200:
             raise EasError(f"OPTIONS 返回 HTTP {response.status_code}：{response.content[:200]!r}")
         content_type = response.header("Content-Type")

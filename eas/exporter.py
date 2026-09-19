@@ -367,6 +367,7 @@ class ExportEngine(BaseExportEngine):
     def __init__(self, settings, password, **kwargs) -> None:
         super().__init__(settings, password, **kwargs)
         self.client: EasClient | None = None
+        self.server_hint: str | None = None
         self._base_url, eas_url = parse_server_url(settings.server_url)
         # 允许用户直接填网页邮箱地址，这里自动补出 ActiveSync 入口
         self.eas_url = eas_url
@@ -393,7 +394,9 @@ class ExportEngine(BaseExportEngine):
                 client.options()
             except EasAuthError as exc:
                 last_error = exc
-                LOGGER.warning("账号写法 %r 未被接受，尝试下一种写法", candidate)
+                self.server_hint = client.server_hint
+                if len(candidates) > 1 and candidate != candidates[-1]:
+                    LOGGER.warning("账号写法 %r 未被接受，试试下一种写法", candidate)
                 continue
             if candidate != settings.user:
                 LOGGER.info("账号写法 %r 可以登录，后续使用它", candidate)
@@ -888,8 +891,12 @@ class AutoExportEngine(BaseExportEngine):
             result = eas_engine.probe()
             self.active = eas_engine
             return result
-        except (NotEasResponse, EasAuthError) as exc:
-            LOGGER.warning("ActiveSync 探测失败（%s），改用 Zimbra 通道探测", exc)
+        except NotEasResponse as exc:
+            LOGGER.warning("ActiveSync 未按协议应答（%s），改用 Zimbra 通道探测", exc)
+        except EasAuthError as exc:
+            if eas_engine.server_hint != "zimbra":
+                raise
+            LOGGER.warning("服务器自称 Zimbra 且认证被拒，改用它自己的接口再试一次：%s", exc)
         self.active = self._make("zimbra")
         return self.active.probe()
 
@@ -912,11 +919,17 @@ class AutoExportEngine(BaseExportEngine):
                 # 已经导出过内容，说明中途出错，不再换通道（避免重复导出）
                 raise
             LOGGER.warning("ActiveSync 未生效，自动改用 Zimbra 通道。原因：%s", exc)
-        except EasAuthError:
-            # 认证失败也可能是"这个端点不属于这个账号"，同样给 Zimbra 一次机会
-            if eas_engine.stats:
+        except EasAuthError as exc:
+            # 认证失败通常就是密码问题：这时换通道只会用同一套错密码再失败一遍，
+            # 把真正的错误埋掉。只有服务器明确自称 Zimbra 时才给它的接口一次机会。
+            if eas_engine.stats or eas_engine.server_hint != "zimbra":
+                LOGGER.error(
+                    "ActiveSync 认证失败（服务器看起来是 %s）：%s",
+                    eas_engine.server_hint or "未知类型",
+                    exc,
+                )
                 raise
-            LOGGER.warning("ActiveSync 认证失败，改试 Zimbra 通道")
+            LOGGER.warning("服务器自称 Zimbra 且认证被拒，改用它的 REST 接口再试一次")
         self.active = self._make("zimbra")
         LOGGER.info("改用 Zimbra 通道：%s", self.active.base_url)
         return self.active.run()
