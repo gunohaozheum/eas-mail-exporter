@@ -210,6 +210,67 @@ def test_zimbra_array_wrapped_responses() -> None:
     assert next(f for f in folders if f.path == "Inbox").total == 3
 
 
+def test_user_root_is_not_part_of_folder_path() -> None:
+    """真实服务器会先给一个名为 USER_ROOT 的根节点，它不能进 REST 地址。
+
+    实际踩到的情况：路径变成 USER_ROOT/Inbox，于是 /home/<账号>/USER_ROOT/Inbox
+    全部 404。这里同时验证 absFolderPath 优先。
+    """
+
+    payload = {
+        "Body": {
+            "GetFolderResponse": {
+                "folder": [
+                    {
+                        "name": "USER_ROOT",
+                        "view": "",
+                        "absFolderPath": "/",
+                        "folder": [
+                            {"name": "Chats", "view": "message", "n": [0], "absFolderPath": "/Chats"},
+                            {"name": "Drafts", "view": "message", "n": [3], "absFolderPath": "/Drafts"},
+                            {"name": "Inbox", "view": "message", "n": [246], "absFolderPath": "/Inbox"},
+                            {
+                                "name": "Projects",
+                                "view": "message",
+                                "n": [0],
+                                "absFolderPath": "/Projects",
+                                "folder": [
+                                    {
+                                        "name": "2026",
+                                        "view": "message",
+                                        "n": [1],
+                                        "absFolderPath": "/Projects/2026",
+                                    }
+                                ],
+                            },
+                            {"name": "Calendar", "view": "appointment", "absFolderPath": "/Calendar"},
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    def handler(method, url, body):
+        request = next(iter(json.loads(body.decode("utf-8"))["Body"]))
+        if request == "AuthRequest":
+            return HttpResponse(
+                200, {}, json.dumps({"Body": {"AuthResponse": {"authToken": [{"_content": "T"}]}}}).encode()
+            )
+        return HttpResponse(200, {}, json.dumps(payload).encode())
+
+    client = ZimbraClient("https://mail.example.edu.cn", "u@example.edu.cn", "pw")
+    client.transport = FakeTransport(handler)
+    folders = client.list_folders()
+    assert folders is not None
+    paths = [folder.path for folder in folders]
+    assert paths == ["Chats", "Drafts", "Inbox", "Projects", "Projects/2026"], paths
+    assert not any(path.startswith("USER_ROOT") for path in paths)
+    assert next(f for f in folders if f.path == "Inbox").total == 246
+    # 生成的 REST 地址也必须直接是 /home/<账号>/Inbox
+    assert client.folder_url("Inbox").endswith("/home/u@example.edu.cn/Inbox?fmt=tgz")
+
+
 def test_zimbra_folder_url_encoding() -> None:
     client = ZimbraClient("https://mail.example.edu.cn", "u@example.edu.cn", "pw")
     url = client.folder_url("Projects/2026 年度")
@@ -494,6 +555,8 @@ if __name__ == "__main__":
     print("文件夹自动发现        ✓")
     test_zimbra_array_wrapped_responses()
     print("数组包裹的响应        ✓")
+    test_user_root_is_not_part_of_folder_path()
+    print("USER_ROOT 不进路径    ✓")
     test_zimbra_folder_url_encoding()
     print("文件夹 URL 编码       ✓")
     test_soap_auth_fault_is_friendly()

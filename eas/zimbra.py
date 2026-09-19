@@ -265,15 +265,33 @@ class ZimbraClient:
 
         folders: list[ZimbraFolder] = []
 
+        def path_of(node: dict, prefix: str) -> str:
+            """优先用服务器给的 absFolderPath（已相对邮箱根），保证 REST 地址正确。"""
+            absolute = first(node.get("absFolderPath"))
+            if isinstance(absolute, str) and absolute.strip("/"):
+                return absolute.strip("/")
+            name = first(node.get("name")) or ""
+            return f"{prefix}/{name}" if prefix else name
+
         def walk(nodes: list, prefix: str = "") -> None:
             for node in nodes:
                 node = first(node)
                 if not isinstance(node, dict):
                     continue
-                name = first(node.get("name")) or ""
+                absolute = first(node.get("absFolderPath"))
+                raw_name = first(node.get("name")) or ""
+                is_root = (
+                    isinstance(absolute, str) and absolute.strip("/") == ""
+                ) or raw_name.upper() in ("", "USER_ROOT")
+                if is_root:
+                    # 根节点（Zimbra 里通常叫 USER_ROOT）不是邮箱夹，
+                    # 也不能出现在 REST 地址里，只继续往下走。
+                    walk(many(node.get("folder")), "")
+                    continue
+                path = path_of(node, prefix)
+                name = raw_name or path.rsplit("/", 1)[-1]
                 view = first(node.get("view")) or ""
-                path = f"{prefix}/{name}" if prefix else name
-                if view == "message" and name:
+                if view == "message" and path:
                     total = None
                     for key in ("n", "total"):
                         value = first(node.get(key))
