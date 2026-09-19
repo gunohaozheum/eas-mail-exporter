@@ -437,6 +437,84 @@ def test_protocol_request_html_is_reported_clearly() -> None:
     raise AssertionError("应当抛出 NotEasResponse")
 
 
+def test_449_with_html_body_is_not_a_crash() -> None:
+    """真实现象：服务器回 HTTP 449（要设备策略）+ HTML 网页。
+
+    以前这里会直接 wbxml.decode → ValueError 崩溃（GUI 弹出"不是 WBXML 数据"）。
+    """
+    client = EasClient(
+        "https://mail.example.edu.cn/Microsoft-Server-ActiveSync", "u@example.edu.cn", "pw"
+    )
+    client.transport = FakeTransport(
+        lambda m, u, b: HttpResponse(449, {"Content-Type": "text/html"}, HTML)
+    )
+    try:
+        client.call("FolderSync", E(FolderHierarchy.FolderSync, E(FolderHierarchy.SyncKey, "0")))
+    except NotEasResponse as exc:
+        assert "不是 ActiveSync" in str(exc)
+        return
+    except ValueError as exc:  # 旧行为
+        raise AssertionError(f"不该再抛 WGXML 解析错误：{exc}")
+    raise AssertionError("应当抛出 NotEasResponse")
+
+
+def _install_fake_backends(eas_handler, zimbra_downloads=None):
+    """把两个通道的客户端工厂换成假传输层，返回 exporter 模块便于还原。"""
+    from eas import exporter as exporter_module
+
+    def eas_factory(url, user, password, **kwargs):
+        client = EasClient(url, user, password)
+        client.transport = FakeTransport(eas_handler)
+        return client
+
+    def zimbra_factory(url, user, password, **kwargs):
+        client = ZimbraClient(url, user, password)
+        client.transport = FakeTransport(soap_handler, downloads=zimbra_downloads or {})
+        return client
+
+    exporter_module.ExportEngine.client_factory = staticmethod(eas_factory)
+    exporter_module.ZimbraExportEngine.client_factory = staticmethod(zimbra_factory)
+    return exporter_module
+
+
+def test_auto_falls_back_when_449_is_html() -> None:
+    """这正是交大的情形：EAS 端点回 449+HTML，auto 应该改用 Zimbra 并跑完。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "auto449"
+    settings = ExportSettings(
+        server_url="https://mail.example.edu.cn",
+        user="u@example.edu.cn",
+        out_dir=out_dir,
+        backend="auto",
+    )
+
+    def eas_handler(method, url, body):
+        if method == "OPTIONS":
+            return HttpResponse(200, {"MS-ASProtocolVersions": "14.1,16.1"}, b"")
+        return HttpResponse(449, {"Content-Type": "text/html"}, HTML)
+
+    engine = create_engine(settings, "pw")
+    module = _install_fake_backends(
+        eas_handler,
+        {
+            "/Projects/2026": make_tgz({"301.eml": MAIL_1}),
+            "/Projects": make_tgz({}),
+            "/Inbox": make_tgz({"101.eml": MAIL_1, "102.eml": MAIL_2}),
+            "/Sent": make_tgz({"201.eml": MAIL_2}),
+            "/Trash": make_tgz({}),
+        },
+    )
+    try:
+        summary = engine.run()
+        assert summary["backend"] == "Zimbra REST", summary["backend"]
+        assert summary["exported"] == 4, summary["exported"]
+    finally:
+        module.ExportEngine.client_factory = staticmethod(EasClient)
+        module.ZimbraExportEngine.client_factory = staticmethod(ZimbraClient)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def test_normal_wbxml_still_decodes() -> None:
     """正常 WBXML 响应不受影响。"""
     payload = wbxml.encode(
@@ -569,6 +647,8 @@ if __name__ == "__main__":
     print("OPTIONS 返回网页      ✓（明确报错）")
     test_protocol_request_html_is_reported_clearly()
     print("协议请求返回网页      ✓（明确报错）")
+    test_449_with_html_body_is_not_a_crash()
+    print("449+网页不崩溃        ✓")
     test_normal_wbxml_still_decodes()
     print("正常 WBXML 不受影响   ✓")
     test_zimbra_engine_end_to_end()
@@ -577,3 +657,5 @@ if __name__ == "__main__":
     print("自动回退到 Zimbra     ✓")
     test_auto_does_not_fall_back_on_exchange_auth_error()
     print("认证失败不回退         ✓")
+    test_auto_falls_back_when_449_is_html()
+    print("449+网页时自动回退     ✓")

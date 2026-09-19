@@ -616,6 +616,21 @@ class EasClient:
             "3) 若服务器启用了二次验证或统一身份认证（SSO），邮箱可能需要单独的客户端密码。"
         )
 
+    def decode_response(self, cmd: str, response: HttpResponse) -> wbxml.Node | None:
+        """把响应体解成 WBXML。
+
+        服务器（尤其是没给这个账号开移动同步的）可能回一个 HTML 网页，
+        这种情况必须明确报成"不是 ActiveSync 响应"，而不是让它去解析二进制。
+        返回 None 表示响应体为空。
+        """
+        if not response.content:
+            return None
+        if not looks_like_wbxml(response.content):
+            raise NotEasResponse(
+                cmd, response.status_code, response.header("Content-Type"), response.content
+            )
+        return wbxml.decode(response.content)
+
     def call(self, cmd: str, root: wbxml.Node | None = None, *, provision_retry: bool = True):
         """发命令并解析 WBXML 响应；返回 None 表示服务器回了空响应体。"""
         body = wbxml.encode(root) if root is not None else b""
@@ -643,7 +658,9 @@ class EasClient:
             # 明确区分"不是 EAS 响应"和"EAS 响应但内容有问题"
             raise NotEasResponse(cmd, response.status_code, content_type, response.content)
         LOGGER.debug("%s 响应：HTTP %s，%s，%d 字节", cmd, response.status_code, content_type or "-", len(response.content))
-        node = wbxml.decode(response.content)
+        node = self.decode_response(cmd, response)
+        if node is None:  # pragma: no cover - 上面已判过非空
+            raise EasError(f"{cmd} 返回空响应体")
         status = provisioning_status(node)
         if status and provision_retry:
             LOGGER.info(
@@ -696,7 +713,7 @@ class EasClient:
         """完成设备策略握手（[MS-ASPROV] 3.1.5.1），返回正式 policy key。"""
         temp_key: str | None = None
         if trigger_response is not None and trigger_response.content:
-            trigger = wbxml.decode(trigger_response.content)
+            trigger = self.decode_response("Provision", trigger_response) or wbxml.Node("Provision")
             self._reject_remote_wipe(trigger)
             temp_key = policy_key_of(trigger)
         if not temp_key:
@@ -717,7 +734,7 @@ class EasClient:
                     raise EasAuthError(f"Provision 确认失败（HTTP 401）：账号 {self.user!r} 没被接受。")
                 if response.status_code != 200:
                     raise EasError(f"Provision 确认返回 HTTP {response.status_code}：{response.content[:200]!r}")
-                node = wbxml.decode(response.content) if response.content else None
+                node = self.decode_response("Provision", response)
                 if node is not None:
                     LOGGER.debug("Provision 确认响应（%s）：\n%s", ACK_VARIANTS[variant][0], wbxml.to_xml(node))
                 status = node.text_of("Status") if node is not None else None
@@ -757,7 +774,7 @@ class EasClient:
                 raise EasAuthError(f"Provision 认证失败（HTTP 401）：账号 {self.user!r} 没被接受。")
             if response.status_code != 200:
                 raise EasError(f"Provision 返回 HTTP {response.status_code}：{response.content[:200]!r}")
-            node = wbxml.decode(response.content) if response.content else None
+            node = self.decode_response("Provision", response)
             key = None
             if node is not None:
                 self._reject_remote_wipe(node)
