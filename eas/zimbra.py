@@ -32,6 +32,25 @@ LOGGER = logging.getLogger("zimbra")
 DEFAULT_FOLDERS = ["Inbox", "Sent", "Drafts", "Junk", "Trash"]
 
 
+def first(value):
+    """Zimbra 的 JSON 会把重复/可选元素包成数组（例如 authToken 是 [{...}]）。
+
+    取值时统一走这里，避免出现 "'list' object has no attribute 'get'"。
+    """
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
+def many(value) -> list:
+    """把可能是 单元素/数组/None 的字段统一成列表。"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if item is not None]
+    return [value]
+
+
 class ZimbraError(RuntimeError):
     """Zimbra 通道错误。"""
 
@@ -169,6 +188,9 @@ class ZimbraClient:
         except Exception as exc:
             data = None
             parse_error = exc
+        # 顶层也可能是数组（Zimbra 对重复元素的包法），取里面的对象
+        if isinstance(data, list):
+            data = next((item for item in data if isinstance(item, dict)), None)
         if data is None:
             if response.status_code != 200:
                 preview = " ".join(response.content[:200].decode("utf-8", "replace").split())
@@ -178,7 +200,15 @@ class ZimbraClient:
                 )
             raise ZimbraError(f"SOAP 响应无法解析为 JSON：{parse_error}") from parse_error
 
+        LOGGER.debug(
+            "SOAP 响应（%d 字节）：%s",
+            len(response.content),
+            " ".join(response.content[:400].decode("utf-8", "replace").split()),
+        )
+
         body_out = data.get("Body") or {}
+        if not isinstance(body_out, dict):
+            body_out = first(body_out) if isinstance(body_out, list) else {}
         if "Fault" in body_out:
             fault = body_out["Fault"]
             reason = (fault.get("Reason") or {}).get("Text") or fault
@@ -205,10 +235,14 @@ class ZimbraClient:
                 }
             }
         )
-        token = ((result.get("AuthResponse") or {}).get("authToken") or {}).get("_content")
+        auth = first(result.get("AuthResponse")) or {}
+        token_node = first(auth.get("authToken")) if isinstance(auth, dict) else None
+        token = token_node.get("_content") if isinstance(token_node, dict) else token_node
         if not token:
-            raise ZimbraAuthError("登录成功但服务器没有返回 authToken")
-        return token
+            raise ZimbraAuthError(
+                "登录成功但服务器没有返回 authToken（响应结构可能变了，请把日志发我）"
+            )
+        return str(token)
 
     def list_folders(self) -> list[ZimbraFolder] | None:
         """列邮件文件夹；失败返回 None（由调用方退回默认名单）。"""
@@ -224,24 +258,30 @@ class ZimbraClient:
             LOGGER.warning("自动获取文件夹列表失败（%s），改用默认文件夹名", exc)
             return None
 
-        root = (result.get("GetFolderResponse") or {}).get("folder") or []
+        response = first(result.get("GetFolderResponse")) or {}
+        root = many(response.get("folder")) if isinstance(response, dict) else []
+        if not root:
+            LOGGER.warning("GetFolder 响应里没有 folder 字段，响应结构：%s", response)
 
         folders: list[ZimbraFolder] = []
 
-        def walk(nodes: list[dict], prefix: str = "") -> None:
+        def walk(nodes: list, prefix: str = "") -> None:
             for node in nodes:
-                name = node.get("name") or ""
-                view = node.get("view") or ""
+                node = first(node)
+                if not isinstance(node, dict):
+                    continue
+                name = first(node.get("name")) or ""
+                view = first(node.get("view")) or ""
                 path = f"{prefix}/{name}" if prefix else name
                 if view == "message" and name:
                     total = None
                     for key in ("n", "total"):
-                        if isinstance(node.get(key), int):
-                            total = node[key]
+                        value = first(node.get(key))
+                        if isinstance(value, int):
+                            total = value
                             break
                     folders.append(ZimbraFolder(path=path, name=name, total=total, view=view))
-                for child in node.get("folder") or []:
-                    walk([child], path)
+                walk(many(node.get("folder")), path)
 
         walk(root)
         if not folders:

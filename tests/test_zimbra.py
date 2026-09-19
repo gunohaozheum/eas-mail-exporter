@@ -167,6 +167,49 @@ def test_zimbra_folder_discovery() -> None:
     assert inbox.total == 2
 
 
+def test_zimbra_array_wrapped_responses() -> None:
+    """Zimbra 的 JSON 会把重复元素包成数组（authToken、folder 子节点都是）。
+
+    这是实际踩到的崩溃：'list' object has no attribute 'get'。
+    """
+
+    def handler(method, url, body):
+        payload = json.loads(body.decode("utf-8"))
+        request = next(iter(payload["Body"]))
+        if request == "AuthRequest":
+            # 注意 authToken 被包成了数组
+            data = {"Body": {"AuthResponse": {"authToken": [{"_content": "TOKEN"}]}}}
+        else:
+            data = {
+                "Body": {
+                    "GetFolderResponse": {
+                        "folder": [
+                            {"name": "Inbox", "view": "message", "n": [3]},
+                            {
+                                "name": "Projects",
+                                "view": "message",
+                                "n": [0],
+                                "folder": [{"name": "2026", "view": "message", "n": [1]}],
+                            },
+                            {"name": "Calendar", "view": "appointment"},
+                        ]
+                    }
+                }
+            }
+        # 顶层也包一层数组
+        return HttpResponse(
+            200, {"Content-Type": "text/javascript"}, json.dumps([data]).encode()
+        )
+
+    client = ZimbraClient("https://mail.example.edu.cn", "u@example.edu.cn", "pw")
+    client.transport = FakeTransport(handler)
+    folders = client.list_folders()
+    assert folders is not None, "数组包裹的响应不该导致退回默认文件夹名"
+    paths = [folder.path for folder in folders]
+    assert paths == ["Inbox", "Projects", "Projects/2026"], paths
+    assert next(f for f in folders if f.path == "Inbox").total == 3
+
+
 def test_zimbra_folder_url_encoding() -> None:
     client = ZimbraClient("https://mail.example.edu.cn", "u@example.edu.cn", "pw")
     url = client.folder_url("Projects/2026 年度")
@@ -449,6 +492,8 @@ if __name__ == "__main__":
     print("tar.gz 解包           ✓")
     test_zimbra_folder_discovery()
     print("文件夹自动发现        ✓")
+    test_zimbra_array_wrapped_responses()
+    print("数组包裹的响应        ✓")
     test_zimbra_folder_url_encoding()
     print("文件夹 URL 编码       ✓")
     test_soap_auth_fault_is_friendly()

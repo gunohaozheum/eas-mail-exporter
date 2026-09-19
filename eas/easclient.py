@@ -304,6 +304,16 @@ PROVISION_REQUIRED_STATUS = {
     "141": "LegacyDeviceOnStrictPolicy",
     "142": "DeviceNotProvisioned",
     "143": "PolicyRefresh",
+    "144": "InvalidPolicyKey",  # 策略 key 失效（常见于设备记录被删除或策略变更后）
+}
+
+# 这些状态码不是"重新 provision 就能好"，要给出明确提示
+STATUS_MEANINGS = {
+    "139": "DeviceNotFullyProvisionable（设备无法满足服务器策略）",
+    "145": "ExternallyManagedDevicesNotAllowed（服务器不允许外部管理的设备）",
+    "146": "NoRecurrenceInCalendar",
+    "147": "UnexpectedItemClass",
+    "148": "RemoteServerHasNoSSL",
 }
 
 
@@ -338,7 +348,11 @@ def parse_folder_sync(root: wbxml.Node) -> tuple[list[Folder], str, list[str]]:
     """
     status = root.text_of("Status")
     if status and status != "1":
-        raise EasError(f"FolderSync 状态异常：Status={status}\n{wbxml.summarize(root, max_depth=4)}")
+        meaning = STATUS_MEANINGS.get(status) or PROVISION_REQUIRED_STATUS.get(status)
+        detail = f"（{meaning}）" if meaning else ""
+        raise EasError(
+            f"FolderSync 状态异常：Status={status}{detail}\n{wbxml.summarize(root, max_depth=4)}"
+        )
 
     folders: list[Folder] = []
     deleted: list[str] = []

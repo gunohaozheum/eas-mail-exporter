@@ -421,7 +421,8 @@ class ExportApp(tk.Tk):
                     self.append_log("已中止。已导出的部分保留，重跑会从断点继续。", "WARNING")
                 elif kind == "error":
                     self.var_status.set("出错")
-                    self.append_log(payload[0], "ERROR")
+                    # 走 logging 而不是直接写控件：这样错误也会落到日志文件里
+                    logging.error("%s", payload[0])
                     messagebox.showerror(APP_TITLE, payload[0])
                 elif kind == "status":
                     self.var_status.set(payload[0])

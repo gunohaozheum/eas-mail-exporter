@@ -16,6 +16,7 @@ from eas import wbxml  # noqa: E402
 from eas.wbxml import E  # noqa: E402
 from eas.easclient import (  # noqa: E402
     ACK_VARIANTS,
+    PROVISION_REQUIRED_STATUS,
     build_fetch,
     build_folder_sync,
     build_provision_ack,
@@ -136,6 +137,10 @@ def test_status_helpers() -> None:
     )
     assert provisioning_status(node) == "142"
     assert provisioning_status(wbxml.decode(wbxml.encode(E("7:FolderSync", E("7:Status", "1"))))) is None
+    # 144 = InvalidPolicyKey：设备记录被删掉或策略变更后会出现，同样要重新 provision
+    assert "144" in PROVISION_REQUIRED_STATUS
+    policy_gone = wbxml.decode(wbxml.encode(E("7:FolderSync", E("7:Status", "144"))))
+    assert provisioning_status(policy_gone) == "144"
     # PolicyKey 可能在任意一个 Policy 元素下
     response = wbxml.decode(
         wbxml.encode(
