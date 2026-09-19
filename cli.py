@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from eas.easclient import EasAuthError, EasError  # noqa: E402
-from eas.exporter import ExportCancelled, ExportEngine, ExportSettings  # noqa: E402
+from eas.exporter import ExportCancelled, ExportSettings, create_engine  # noqa: E402
+from eas.zimbra import ZimbraAuthError, ZimbraError  # noqa: E402
 
 
 def setup_logging(out_dir: Path, verbose: bool) -> Path:
@@ -38,9 +39,24 @@ def setup_logging(out_dir: Path, verbose: bool) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="用 Exchange ActiveSync 全量导出邮箱邮件")
-    parser.add_argument("--url", required=True, help="ActiveSync 入口，例如 https://mail.example.com/Microsoft-Server-ActiveSync")
+    parser.add_argument(
+        "--url",
+        required=True,
+        help="邮件服务器地址：可填 ActiveSync 入口，也可直接填网页邮箱地址（自动推导）",
+    )
     parser.add_argument("--user", required=True, help="账号，例如 you@example.com")
     parser.add_argument("--out", required=True, help="导出目录")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "eas", "zimbra"],
+        default="auto",
+        help="通道：auto=先试 ActiveSync，不行自动改走 Zimbra（默认）",
+    )
+    parser.add_argument(
+        "--zimbra-folder",
+        action="append",
+        help="Zimbra 通道下额外导出的文件夹路径（可重复；默认自动发现）",
+    )
     parser.add_argument("--probe", action="store_true", help="只探测：列出版本与文件夹树后退出")
     parser.add_argument("--only", action="append", help="只处理路径包含该子串的文件夹（可重复）")
     parser.add_argument("--window-size", type=int, default=100, help="每页条目数（默认 100）")
@@ -65,12 +81,14 @@ def main(argv: list[str] | None = None) -> int:
         server_url=args.url,
         user=args.user,
         out_dir=out_dir,
+        backend=args.backend,
         device_id=args.device_id,
         device_type=args.device_type,
         protocol_version=args.protocol_version,
         window_size=args.window_size,
         verify_tls=not args.insecure,
         only=args.only or [],
+        zimbra_folders=args.zimbra_folder or [],
         max_items=args.max_items,
         verify=not args.no_verify,
         try_user_variants=args.try_user_variants,
@@ -81,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("密码为空，退出")
         return 2
 
-    engine = ExportEngine(settings, password)
+    engine = create_engine(settings, password)
     try:
         if args.probe:
             engine.probe()
@@ -91,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
     except ExportCancelled:
         logging.warning("已中止")
         return 130
+    except ZimbraAuthError as exc:
+        logging.error("Zimbra 认证失败：%s", exc)
+        return 3
+    except ZimbraError as exc:
+        logging.error("Zimbra 通道出错：%s", exc)
+        return 4
     except EasAuthError as exc:
         logging.error("%s", exc)
         return 3
@@ -102,7 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
     logging.info(
-        "完成：共 %d 封（本次新增 %d），失败 %d 条，用时 %.0f 秒",
+        "完成（%s）：共 %d 封（本次新增 %d），失败 %d 条，用时 %.0f 秒",
+        summary.get("backend", "?"),
         summary["exported"],
         summary["exported_now"],
         summary["failed"],

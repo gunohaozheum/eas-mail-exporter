@@ -20,8 +20,9 @@ from tkinter import filedialog, messagebox, ttk
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from eas.easclient import EasAuthError, EasError  # noqa: E402
-from eas.exporter import ExportCancelled, ExportEngine, ExportSettings  # noqa: E402
+from eas.easclient import EasAuthError, EasError, NotEasResponse  # noqa: E402
+from eas.exporter import ExportCancelled, ExportSettings, create_engine  # noqa: E402
+from eas.zimbra import ZimbraAuthError, ZimbraError  # noqa: E402
 
 APP_TITLE = "EAS 邮箱导出工具"
 CONFIG_DIR = Path(os.environ.get("APPDATA") or Path.home()) / "eas-mail-exporter"
@@ -78,6 +79,7 @@ class ExportApp(tk.Tk):
         self.var_insecure = tk.BooleanVar(value=False)
         self.var_window = tk.IntVar(value=100)
         self.var_device = tk.StringVar(value="EASMAILEXPORT01")
+        self.var_backend = tk.StringVar(value="auto")
         self.var_status = tk.StringVar(value="就绪")
         self.var_current = tk.StringVar(value="尚未开始")
         self.var_counts = tk.StringVar(value="已导出 0 封　失败 0 条　用时 00:00")
@@ -97,11 +99,13 @@ class ExportApp(tk.Tk):
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
 
-        ttk.Label(form, text="ActiveSync 地址").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(form, text="服务器地址").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(form, textvariable=self.var_url).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(form, text="例如 https://mail.example.com/Microsoft-Server-ActiveSync", foreground="#666").grid(
-            row=1, column=1, sticky="w"
-        )
+        ttk.Label(
+            form,
+            text="可填 ActiveSync 入口，也可直接填网页邮箱地址（例如 https://mail.example.edu.cn）",
+            foreground="#666",
+        ).grid(row=1, column=1, sticky="w")
 
         ttk.Label(form, text="账号").grid(row=2, column=0, sticky="w", pady=4)
         ttk.Entry(form, textvariable=self.var_user).grid(row=2, column=1, sticky="ew", pady=4)
@@ -118,6 +122,20 @@ class ExportApp(tk.Tk):
         out_row.columnconfigure(0, weight=1)
         ttk.Entry(out_row, textvariable=self.var_out).grid(row=0, column=0, sticky="ew")
         ttk.Button(out_row, text="浏览…", command=self.pick_folder).grid(row=0, column=1, padx=(6, 0))
+
+        ttk.Label(form, text="通道").grid(row=6, column=0, sticky="w", pady=4)
+        backend_row = ttk.Frame(form)
+        backend_row.grid(row=6, column=1, sticky="w", pady=4)
+        for index, (value, label) in enumerate(
+            (
+                ("auto", "自动（先试 ActiveSync，不行改走 Zimbra）"),
+                ("eas", "只读 ActiveSync（Exchange）"),
+                ("zimbra", "只读 Zimbra REST"),
+            )
+        ):
+            ttk.Radiobutton(backend_row, text=label, value=value, variable=self.var_backend).grid(
+                row=index, column=0, sticky="w"
+            )
 
         options = ttk.LabelFrame(outer, text="选项", padding=10)
         options.pack(fill="x", pady=(10, 0))
@@ -187,6 +205,7 @@ class ExportApp(tk.Tk):
         self.var_user.set(config.get("user", self.var_user.get()))
         self.var_out.set(config.get("out", self.var_out.get()))
         self.var_device.set(config.get("device_id", self.var_device.get()))
+        self.var_backend.set(config.get("backend", self.var_backend.get()))
         self.var_window.set(int(config.get("window_size", self.var_window.get())))
         self.var_verify.set(bool(config.get("verify", True)))
         self.var_variants.set(bool(config.get("try_user_variants", False)))
@@ -202,6 +221,7 @@ class ExportApp(tk.Tk):
                         "user": self.var_user.get().strip(),
                         "out": self.var_out.get().strip(),
                         "device_id": self.var_device.get().strip(),
+                        "backend": self.var_backend.get(),
                         "window_size": int(self.var_window.get() or 100),
                         "verify": bool(self.var_verify.get()),
                         "try_user_variants": bool(self.var_variants.get()),
@@ -262,6 +282,7 @@ class ExportApp(tk.Tk):
             server_url=self.var_url.get().strip(),
             user=self.var_user.get().strip(),
             out_dir=out_dir,
+            backend=self.var_backend.get(),
             device_id=self.var_device.get().strip() or "EASMAILEXPORT01",
             window_size=int(self.var_window.get() or 100),
             verify_tls=not self.var_insecure.get(),
@@ -294,15 +315,12 @@ class ExportApp(tk.Tk):
         self.save_config()
         self._set_running(True)
         self.var_status.set("正在测试连接…")
-        engine = ExportEngine(self._settings(out_dir), self.var_password.get(), progress=self._on_event)
+        engine = create_engine(self._settings(out_dir), self.var_password.get(), progress=self._on_event)
 
         def work() -> None:
             try:
-                folders, paths = engine.probe()
-                self.events.put(("log", "INFO", f"连接成功，共 {len(folders)} 个文件夹"))
-                for folder in folders:
-                    kind = "邮件" if folder.is_mail else "非邮件"
-                    self.events.put(("log", "INFO", f"    {paths[folder.server_id]}（{kind}）"))
+                engine.probe()
+                self.events.put(("log", "INFO", "探测完成（详情见上方日志）"))
                 self.events.put(("status", "测试完成"))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
@@ -322,7 +340,7 @@ class ExportApp(tk.Tk):
         self.started_at = time.time()
         self.last_folder = ""
         self.bar_folders.configure(value=0, maximum=100)
-        engine = ExportEngine(
+        engine = create_engine(
             self._settings(out_dir),
             self.var_password.get(),
             progress=self._on_event,
@@ -337,6 +355,12 @@ class ExportApp(tk.Tk):
                 self.events.put(("cancelled", None))
             except EasAuthError as exc:
                 self.events.put(("error", f"认证失败：{exc}"))
+            except ZimbraAuthError as exc:
+                self.events.put(("error", f"Zimbra 认证失败：{exc}"))
+            except NotEasResponse as exc:
+                self.events.put(("error", str(exc)))
+            except ZimbraError as exc:
+                self.events.put(("error", f"Zimbra 通道出错：{exc}"))
             except EasError as exc:
                 self.events.put(("error", str(exc)))
             except Exception as exc:  # 兜底：别让界面线程静默死掉

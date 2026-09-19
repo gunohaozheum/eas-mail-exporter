@@ -41,3 +41,6 @@ jobs:
 
       - name: Export engine internals
         run: python tests/test_engine.py
+
+      - name: Zimbra channel and defensive diagnostics
+        run: python tests/test_zimbra.py

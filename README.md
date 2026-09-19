@@ -30,6 +30,9 @@ stays open because phones rely on it.
 
 * **GUI + CLI** — double-click `启动.bat` (Windows) or run `python app_gui.pyw`.
 * **Zero dependencies** — only the Python standard library (`tkinter` + `urllib`).
+* **Two channels** — Exchange ActiveSync (Microsoft protocol) and Zimbra REST. In
+  `auto` mode it tries ActiveSync first and switches to Zimbra when the server
+  does not answer as an ActiveSync endpoint.
 * **Resumable** — per-folder sync keys are stored, so an interrupted run continues
   where it stopped instead of re-downloading.
 * **Faithful output** — asks the server for the full MIME source; per-item fallback
@@ -59,13 +62,36 @@ The password is kept in memory only. It is never written to disk or to the log.
 ### Quick start (CLI)
 
 ```bash
-python cli.py --url https://mail.example.com/Microsoft-Server-ActiveSync \
+python cli.py --url https://mail.example.com \
               --user you@example.com --out ~/mail-export --probe
 ```
 
 `--probe` lists the folders without downloading anything. Drop it to export.
-Useful flags: `--only 收件箱`, `--window-size 100`, `--no-verify`, `--insecure`,
-`--verbose`.
+The URL may be the ActiveSync endpoint or just the webmail address — the
+ActiveSync entry point is derived automatically.
+
+Useful flags: `--backend auto|eas|zimbra` (default `auto`), `--only 收件箱`,
+`--zimbra-folder "Projects/2026"`, `--window-size 100`, `--no-verify`,
+`--insecure`, `--verbose`.
+
+### Channels
+
+| Channel | Protocol | Works when |
+| --- | --- | --- |
+| `eas` | Exchange ActiveSync (WBXML over HTTP) | the account has mobile sync enabled |
+| `zimbra` | Zimbra REST `GET /home/<mailbox>/<folder>?fmt=tgz` plus SOAP `GetFolder` | it is a Zimbra server (no mobile-sync licence needed) |
+| `auto` | try `eas`, fall back to `zimbra` | you are not sure which one applies |
+
+The Zimbra channel downloads each mail folder as a `tar.gz` of `.eml` files and
+unpacks it into the same `eml/<folder>/*.eml` layout; folder names come from SOAP
+(`view == "message"`), and if that fails it falls back to `Inbox, Sent, Drafts,
+Junk, Trash`. The temporary archive is deleted after unpacking, so a re-run
+downloads it again (which also guarantees you see new mail).
+
+If a server answers an ActiveSync request with a web page instead of WBXML — the
+usual symptom of "mobile sync is not enabled for this account" — the tool now
+says exactly that (HTTP status, content type, first bytes) instead of failing
+with a parse error, and `auto` mode moves on to the Zimbra channel.
 
 ### Output layout
 
@@ -116,6 +142,8 @@ python tests/test_wbxml.py       # encoder matches Microsoft's byte-level exampl
 python tests/test_requests.py    # request encoding for every command
 python tests/test_responses.py   # response parsing for FolderSync/Sync/ItemOperations
 python tests/test_headers.py     # RFC 2047 + raw UTF-8 header decoding
+python tests/test_engine.py      # file naming, folder paths, state and index
+python tests/test_zimbra.py      # Zimbra channel + non-EAS response diagnostics
 ```
 
 ### Build a standalone .exe (optional)
@@ -127,8 +155,9 @@ Windows: run `build_exe.bat` (installs PyInstaller and produces
 
 * Mail folders only. Calendar, contacts, tasks and notes are reported and skipped
   (they cannot be represented as `.eml`).
-* Requires ActiveSync to be enabled for the account; some tenants disable it or
-  enforce MFA, in which case the connection fails with HTTP 401.
+* ActiveSync requires that mobile sync is enabled for the account; some tenants
+  disable it or enforce MFA, in which case the request is rejected or answered
+  with a web page. Use the Zimbra channel (or `auto`) in that case.
 * First-time provisioning registers a device partnership in the mailbox.
 
 ### License
@@ -153,6 +182,8 @@ name or GitHub handle before publishing.
 
 * **图形界面 + 命令行**：Windows 下双击 `启动.bat` 即可；也可以 `python cli.py ...`。
 * **零第三方依赖**：只用 Python 标准库（`tkinter` + `urllib`），不需要 pip 安装任何东西。
+* **两条通道**：Exchange ActiveSync（微软协议）与 Zimbra REST；`auto` 模式会先试
+  ActiveSync，服务器没按 ActiveSync 应答时自动改走 Zimbra。
 * **断点续传**：每个文件夹记录服务器返回的同步键，中断后重跑会接着来，不重复下载。
 * **完整度高**：优先要求服务器内嵌完整 MIME；只给摘要的条目再单独补取；仍然拿不到的
   会记进失败清单并在报告里列出，不会静默丢弃。
@@ -176,13 +207,33 @@ name or GitHub handle before publishing.
 ### 快速开始（命令行）
 
 ```bash
-python cli.py --url https://mail.example.com/Microsoft-Server-ActiveSync ^
+python cli.py --url https://mail.example.com ^
               --user you@example.com --out D:\mail-export --probe
 ```
 
 `--probe` 只列文件夹、不下载邮件；去掉它就是正式导出。常用参数：
-`--only 收件箱`（只导某个文件夹）、`--window-size 100`、`--no-verify`、
-`--insecure`、`--verbose`。
+`--backend auto|eas|zimbra`（默认 auto）、`--only 收件箱`（只导某个文件夹）、
+`--zimbra-folder "Projects/2026"`（补充 Zimbra 文件夹）、`--window-size 100`、
+`--no-verify`、`--insecure`、`--verbose`。
+
+地址既可以填 ActiveSync 入口，也可以直接填网页邮箱地址——入口地址会自动推导出来。
+
+### 两条通道
+
+| 通道 | 协议 | 适用条件 |
+| --- | --- | --- |
+| `eas` | Exchange ActiveSync（WBXML over HTTP） | 账号已启用移动同步 |
+| `zimbra` | Zimbra REST `GET /home/<邮箱>/<文件夹>?fmt=tgz` + SOAP `GetFolder` | 服务器是 Zimbra（不需要移动同步授权） |
+| `auto` | 先试 `eas`，不行改走 `zimbra` | 不确定该用哪条 |
+
+Zimbra 通道会把每个邮件文件夹整包下载成 `tar.gz`（里面是一封封 `.eml`），解包到同一套
+`eml/<文件夹>/*.eml` 目录结构里；文件夹列表来自 SOAP（只取 `view == "message"` 的邮件夹），
+拿不到就退回 `Inbox, Sent, Drafts, Junk, Trash`。解包后临时压缩包会删除，所以重跑会重新下载
+（这也保证能看到新邮件）。
+
+如果服务器用网页而不是 WBXML 回应 ActiveSync 请求——这正是"该账号没启用移动同步"的典型
+表现——工具现在会直接说清楚（HTTP 状态码、Content-Type、响应开头字节），而不是抛一个看不懂
+的解析错误；`auto` 模式下还会自动改走 Zimbra 通道。
 
 ### 输出结构
 
@@ -232,6 +283,8 @@ python tests/test_wbxml.py       # 编码结果与微软官方逐字节样例完
 python tests/test_requests.py    # 各命令的请求编码
 python tests/test_responses.py   # FolderSync / Sync / ItemOperations 响应解析
 python tests/test_headers.py     # RFC 2047 与原始 UTF-8 邮件头解码
+python tests/test_engine.py      # 文件名、文件夹路径、状态与索引
+python tests/test_zimbra.py      # Zimbra 通道 + 非 ActiveSync 响应的诊断
 ```
 
 ### 打包成独立 exe（可选）
@@ -242,7 +295,8 @@ Windows 下运行 `build_exe.bat`，会自动安装 PyInstaller 并生成
 ### 已知限制
 
 * 只导出邮件文件夹；日历、联系人、任务、便笺会被识别并跳过（它们不适合用 `.eml` 表示）。
-* 需要账号已启用 ActiveSync；若服务器强制二次验证或关闭了 ActiveSync，会以 HTTP 401 失败。
+* ActiveSync 需要账号已启用移动同步；若服务器关闭了它或强制二次验证，请求会被拒绝或返回网页，
+  这种情况下改用 Zimbra 通道（或 `auto`）。
 * 首次连接会在邮箱里留下一条设备记录。
 
 ### 许可证

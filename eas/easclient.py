@@ -21,7 +21,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from . import wbxml
 from .mime import looks_like_mime, parse_mime_payload
@@ -39,6 +40,33 @@ class EasError(RuntimeError):
 
 class EasAuthError(EasError):
     """认证失败（账号/密码/域名格式不对）。"""
+
+
+class NotEasResponse(EasError):
+    """服务器回的不是 ActiveSync（WBXML）响应。
+
+    典型场景：账号没有启用移动同步，服务器把请求落回网页登录流程，返回一个
+    HTTP 200 的 HTML 页面。这类情况必须明确报出来，否则就会在下游的 WBXML
+    解析里报一个看不懂的错。
+    """
+
+    def __init__(self, cmd: str, status: int, content_type: str, body: bytes) -> None:
+        self.status = status
+        self.content_type = content_type
+        self.body = body
+        preview = body[:160].decode("utf-8", "replace")
+        preview = " ".join(preview.split())
+        super().__init__(
+            f"{cmd} 收到的不是 ActiveSync 协议响应：HTTP {status}，"
+            f"Content-Type: {content_type or '未提供'}。\n"
+            f"响应开头：{preview!r}\n"
+            "常见原因：该账号未启用移动同步（ActiveSync），请求被回退到了网页登录或错误页。"
+        )
+
+
+def looks_like_wbxml(data: bytes) -> bool:
+    """WBXML 数据以 0x03（版本号）开头。"""
+    return bool(data) and data[:1] == b"\x03"
 
 
 @dataclass
@@ -92,6 +120,40 @@ class HttpTransport:
             except Exception:
                 payload = b""
             return HttpResponse(exc.code, exc.headers or {}, payload)
+
+    def download(
+        self,
+        url: str,
+        dest: Path,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 900.0,
+        progress: "Callable[[int], None] | None" = None,
+        chunk_size: int = 256 * 1024,
+    ) -> int:
+        """把响应体流式写入文件（大附件/整箱导出时避免一次性读进内存）。
+
+        返回写入的字节数；非 2xx 会抛 EasError。
+        """
+        request = urllib.request.Request(url, headers=headers or {}, method="GET")
+        try:
+            with self.opener.open(request, timeout=timeout) as response:
+                status = response.status
+                if status != 200:
+                    raise EasError(f"下载返回 HTTP {status}：{url}")
+                written = 0
+                with open(dest, "wb") as handle:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        handle.write(chunk)
+                        written += len(chunk)
+                        if progress is not None:
+                            progress(written)
+                return written
+        except urllib.error.HTTPError as exc:
+            raise EasError(f"下载返回 HTTP {exc.code}：{url}") from exc
 
 
 @dataclass
@@ -540,6 +602,11 @@ class EasClient:
                 return None
             response = retry
 
+        content_type = response.header("Content-Type")
+        if not looks_like_wbxml(response.content):
+            # 明确区分"不是 EAS 响应"和"EAS 响应但内容有问题"
+            raise NotEasResponse(cmd, response.status_code, content_type, response.content)
+        LOGGER.debug("%s 响应：HTTP %s，%s，%d 字节", cmd, response.status_code, content_type or "-", len(response.content))
         node = wbxml.decode(response.content)
         status = provisioning_status(node)
         if status and provision_retry:
@@ -564,6 +631,10 @@ class EasClient:
             raise EasAuthError(f"认证失败（HTTP 401）：账号 {self.user!r} 没被接受。")
         if response.status_code != 200:
             raise EasError(f"OPTIONS 返回 HTTP {response.status_code}：{response.content[:200]!r}")
+        content_type = response.header("Content-Type")
+        if "html" in content_type.lower() or response.content[:1] == b"<":
+            # 连协议协商都落回网页了，说明这个端点不是给这个账号用的
+            raise NotEasResponse("OPTIONS", response.status_code, content_type, response.content)
         self.server_versions = [
             item.strip() for item in response.header("MS-ASProtocolVersions").split(",") if item.strip()
         ]
@@ -792,6 +863,7 @@ __all__ = [
     "Folder",
     "HttpResponse",
     "HttpTransport",
+    "NotEasResponse",
     "SyncItem",
     "SyncPage",
     "build_fetch",
@@ -801,6 +873,7 @@ __all__ = [
     "build_sync",
     "find_mime",
     "looks_like_mime",
+    "looks_like_wbxml",
     "parse_folder_sync",
     "parse_sync_item",
     "parse_sync_page",

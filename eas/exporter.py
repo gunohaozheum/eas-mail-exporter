@@ -1,12 +1,13 @@
-"""导出引擎：把 ActiveSync 邮箱整箱导出成本地 .eml 文件。
+"""导出引擎：把邮箱整箱导出成本地 .eml 文件。
 
-界面（GUI / 命令行）都只调用这里，因此核心逻辑只有一份：
+两条通道，界面（GUI / 命令行）共用同一份核心：
 
-* 断点续传：每个文件夹记录服务器返回的 SyncKey 与已导出条目 ID；
-* 完整度：优先要求服务器在 Sync 里内嵌完整 MIME，个别没带的用
-  ItemOperations 单独补取；拿不到的记进失败清单，不静默丢弃；
-* 可核查：保留邮件原文（含全部邮件头与附件），生成 index.csv 与 report.md，
-  收尾再做一次"零变更"复核。
+* `ExportEngine`       —— Exchange ActiveSync（微软协议）
+* `ZimbraExportEngine` —— Zimbra REST/SOAP（Zimbra 自带的整箱导出）
+* `create_engine()`    —— 按设置挑选；`auto` 模式下 ActiveSync 不可用时自动改走 Zimbra
+
+共同点：断点续传、按邮件原文重建文件名、index.csv 索引、report.md 报告、
+失败清单（不静默丢弃）。进度通过 progress 回调报告，取消通过 cancel 事件。
 """
 
 from __future__ import annotations
@@ -29,10 +30,21 @@ from .easclient import (
     EasClient,
     EasError,
     Folder,
+    NotEasResponse,
     SyncItem,
     user_variants,
 )
 from .mime import mime_metadata
+from .zimbra import (
+    DEFAULT_FOLDERS,
+    ZimbraAuthError,
+    ZimbraClient,
+    ZimbraError,
+    ZimbraFolder,
+    extract_messages,
+    is_eas_url,
+    parse_server_url,
+)
 
 LOGGER = logging.getLogger("eas.export")
 
@@ -68,7 +80,7 @@ def safe_name(value: str, limit: int = 70) -> str:
 
 
 def eml_basename(stamp: str, sender: str, subject: str, server_id: str) -> str:
-    """.eml 文件名主干：时间_发件人_主题_ServerId。"""
+    """.eml 文件名主干：时间_发件人_主题_标识。"""
     parts = [stamp, safe_name(sender, 30), safe_name(subject, 60)]
     base = "_".join(part for part in parts if part)
     return f"{base}_{safe_name(server_id.replace(':', '-'), 24)}"
@@ -97,14 +109,14 @@ def folder_paths(folders: list[Folder]) -> dict[str, str]:
 
 
 class State:
-    """断点续传状态：SyncKey、已导出条目、失败记录、设备策略 key。"""
+    """断点续传状态：已导出条目、同步键、失败记录。"""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.data: dict = {"version": 1, "folders": {}, "failures": {}}
         if path.exists():
             try:
-                self.data.update(json.loads(path.read_text(encoding="utf-8")))
+                self.data.update(json.loads(path.read_text(encoding="utf-8-sig")))
             except Exception as exc:  # 状态文件损坏不该让整个导出失败
                 LOGGER.warning("状态文件无法读取（%s），将重新开始", exc)
 
@@ -112,15 +124,15 @@ class State:
     def folders(self) -> dict:
         return self.data.setdefault("folders", {})
 
-    def folder(self, server_id: str, **defaults) -> dict:
-        entry = self.folders.setdefault(server_id, {"exported": [], "sync_key": "0"})
-        for key, value in defaults.items():
-            entry.setdefault(key, value)
+    def folder(self, key: str, **defaults) -> dict:
+        entry = self.folders.setdefault(key, {"exported": [], "sync_key": "0"})
+        for name, value in defaults.items():
+            entry.setdefault(name, value)
         entry.setdefault("exported", [])
         return entry
 
-    def record_failure(self, server_id: str, item_id: str, reason: str) -> None:
-        self.data.setdefault("failures", {})[f"{server_id}|{item_id}"] = reason
+    def record_failure(self, folder: str, item_id: str, reason: str) -> None:
+        self.data.setdefault("failures", {})[f"{folder}|{item_id}"] = reason
 
     def save(self, client: EasClient | None = None) -> None:
         self.data["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -173,22 +185,26 @@ class ExportSettings:
     server_url: str
     user: str
     out_dir: Path
+    backend: str = "auto"  # auto / eas / zimbra
     device_id: str = DEFAULT_DEVICE_ID
     device_type: str = DEFAULT_DEVICE_TYPE
     protocol_version: str = "16.1"
     window_size: int = 100
     verify_tls: bool = True
     only: list[str] = field(default_factory=list)
+    zimbra_folders: list[str] = field(default_factory=list)
     max_items: int = 0
     verify: bool = True
     try_user_variants: bool = False
 
 
-# --------------------------------------------------------------------- 引擎
+# --------------------------------------------------------------------- 基类
 
 
-class ExportEngine:
-    """执行一次导出。进度通过 progress 回调报告，取消通过 cancel 事件。"""
+class BaseExportEngine:
+    """两条通道共用的部分：进度/取消、写文件、索引、报告。"""
+
+    protocol_label = "未知通道"
 
     def __init__(
         self,
@@ -202,9 +218,9 @@ class ExportEngine:
         self.password = password
         self.progress = progress or (lambda event: None)
         self.cancel = cancel or threading.Event()
-        self.client: EasClient | None = None
-        self.state = State(Path(settings.out_dir) / "state.json")
-        self.index = Index(Path(settings.out_dir) / "index.csv")
+        self.out_dir = Path(settings.out_dir)
+        self.state = State(self.out_dir / "state.json")
+        self.index = Index(self.out_dir / "index.csv")
         self.stats: dict[str, dict] = {}
 
     # --- 辅助 ---
@@ -219,6 +235,124 @@ class ExportEngine:
         if self.cancel.is_set():
             raise ExportCancelled("用户中止了导出")
 
+    def save_message(
+        self,
+        folder_path: str,
+        item_id: str,
+        mime: bytes,
+        *,
+        kind: str = "Add",
+        date_hint: str = "",
+        subject_hint: str = "",
+        sender_hint: str = "",
+    ) -> Path:
+        """写一个 .eml 并记进索引。元数据以邮件原文为准，摘要字段只作兜底。"""
+        meta = mime_metadata(mime)
+        subject = meta.get("subject") or subject_hint
+        sender = meta.get("from") or sender_hint
+        stamp = meta.get("date") or re.sub(r"[^0-9]", "", date_hint or "")[:14]
+        if not stamp:
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        base = eml_basename(stamp, sender, subject, item_id)
+        target_dir = self.out_dir / "eml" / folder_path
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{base}.eml"
+        counter = 1
+        while path.exists():
+            path = target_dir / f"{base}({counter}).eml"
+            counter += 1
+        path.write_bytes(mime)
+        self.index.add(
+            folder=folder_path,
+            server_id=item_id,
+            kind=kind,
+            date_received=date_hint,
+            **{"from": sender},
+            subject=subject,
+            size_bytes=len(mime),
+            file=str(path.relative_to(self.out_dir)),
+            note=meta.get("message_id", ""),
+        )
+        return path
+
+    # --- 收尾 ---
+
+    def build_summary(self, started: float) -> dict:
+        eml_dir = self.out_dir / "eml"
+        return {
+            "exported": sum(item.get("exported_total", 0) for item in self.stats.values()),
+            "exported_now": sum(item.get("exported_now", 0) for item in self.stats.values()),
+            "failed": len(self.state.data.get("failures", {})),
+            "bytes": sum(path.stat().st_size for path in eml_dir.rglob("*.eml")) if eml_dir.exists() else 0,
+            "seconds": round(time.time() - started, 1),
+            "report": str(self.out_dir / "report.md"),
+            "folders": dict(self.stats),
+            "backend": self.protocol_label,
+        }
+
+    def write_report(self) -> Path:
+        settings = self.settings
+        total = sum(item.get("exported_total", 0) for item in self.stats.values())
+        now = sum(item.get("exported_now", 0) for item in self.stats.values())
+        failures = self.state.data.get("failures", {})
+        eml_dir = self.out_dir / "eml"
+        bytes_on_disk = sum(path.stat().st_size for path in eml_dir.rglob("*.eml")) if eml_dir.exists() else 0
+        lines = [
+            "# 邮箱导出报告",
+            "",
+            f"- 账号：`{settings.user}`",
+            f"- 服务器：`{settings.server_url}`",
+            f"- 通道：{self.protocol_label}",
+            f"- 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            f"共导出 **{total}** 封（本次新增 {now} 封），磁盘占用 {bytes_on_disk / 1048576:.1f} MB，"
+            f"失败 {len(failures)} 条。",
+            "",
+            "| 文件夹 | 累计封数 | 本次新增 | 单独补取 | 失败 | 用时(s) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for name, info in sorted(self.stats.items()):
+            if "error" in info:
+                lines.append(f"| {name} | - | - | - | 出错 | - |")
+            else:
+                lines.append(
+                    f"| {name} | {info.get('exported_total', 0)} | {info.get('exported_now', 0)} | "
+                    f"{info.get('fetched_individually', 0)} | {info.get('failed', 0)} | {info.get('seconds', 0)} |"
+                )
+        if failures:
+            lines += ["", "## 失败条目", ""]
+            for key, reason in sorted(failures.items()):
+                lines.append(f"- `{key}`：{reason}")
+        lines += [
+            "",
+            "## 文件说明",
+            "",
+            "- `eml/<文件夹路径>/*.eml`：每封邮件的原始 MIME，含全部邮件头与附件",
+            "- `index.csv`：索引（文件夹、服务器 ID、时间、发件人、主题、大小、文件路径）",
+            "- `state.json`：断点续传状态，重跑会自动续传（删掉它则从头再来）",
+            "",
+        ]
+        report = self.out_dir / "report.md"
+        report.write_text("\n".join(lines), encoding="utf-8")
+        return report
+
+
+# --------------------------------------------------------------------- EAS 通道
+
+
+class ExportEngine(BaseExportEngine):
+    """Exchange ActiveSync 通道。"""
+
+    protocol_label = "Exchange ActiveSync"
+    client_factory = EasClient  # 测试可替换，便于离线注入假传输层
+
+    def __init__(self, settings, password, **kwargs) -> None:
+        super().__init__(settings, password, **kwargs)
+        self.client: EasClient | None = None
+        self._base_url, eas_url = parse_server_url(settings.server_url)
+        # 允许用户直接填网页邮箱地址，这里自动补出 ActiveSync 入口
+        self.eas_url = eas_url
+
     # --- 连接 ---
 
     def connect(self) -> EasClient:
@@ -227,8 +361,8 @@ class ExportEngine:
         candidates = user_variants(settings.user) if settings.try_user_variants else [settings.user]
         last_error: Exception | None = None
         for candidate in candidates:
-            client = EasClient(
-                settings.server_url,
+            client = self.client_factory(
+                self.eas_url,
                 candidate,
                 self.password,
                 device_id=settings.device_id,
@@ -246,6 +380,7 @@ class ExportEngine:
             if candidate != settings.user:
                 LOGGER.info("账号写法 %r 可以登录，后续使用它", candidate)
             self.client = client
+            self.protocol_label = f"Exchange ActiveSync {client.protocol_version}"
             self.state.save(client)
             return client
         raise last_error or EasAuthError("认证失败")
@@ -276,11 +411,11 @@ class ExportEngine:
 
     def run(self) -> dict:
         settings = self.settings
-        out_dir = Path(settings.out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
         started = time.time()
         LOGGER.info("目标账号：%s", settings.user)
-        LOGGER.info("导出目录：%s", out_dir)
+        LOGGER.info("导出目录：%s", self.out_dir)
+        LOGGER.info("ActiveSync 入口：%s", self.eas_url)
 
         self.connect()
         folders, paths = self.list_folders()
@@ -289,16 +424,12 @@ class ExportEngine:
         if settings.only:
             needles = [needle.lower() for needle in settings.only]
             targets = [
-                folder
-                for folder in targets
+                folder for folder in targets
                 if any(needle in paths[folder.server_id].lower() for needle in needles)
             ]
         skipped = [folder for folder in folders if folder not in targets]
         if skipped:
-            LOGGER.info(
-                "跳过 %d 个非邮件文件夹（日历/联系人/任务等）",
-                len(skipped),
-            )
+            LOGGER.info("跳过 %d 个非邮件文件夹（日历/联系人/任务等）", len(skipped))
         LOGGER.info("准备导出 %d 个邮件文件夹", len(targets))
         self._emit(event="folders", total=len(targets), names=[paths[f.server_id] for f in targets])
 
@@ -324,20 +455,8 @@ class ExportEngine:
 
         self.index.flush()
         self.state.save(self.client)
-        report = self.write_report()
-        summary = {
-            "exported": sum(item.get("exported_total", 0) for item in self.stats.values()),
-            "exported_now": sum(item.get("exported_now", 0) for item in self.stats.values()),
-            "failed": len(self.state.data.get("failures", {})),
-            "bytes": sum(
-                path.stat().st_size for path in (out_dir / "eml").rglob("*.eml")
-            )
-            if (out_dir / "eml").exists()
-            else 0,
-            "seconds": round(time.time() - started, 1),
-            "report": str(report),
-            "folders": dict(self.stats),
-        }
+        summary = self.build_summary(started)
+        self.write_report()
         self._emit(event="done", stats=summary)
         return summary
 
@@ -346,8 +465,6 @@ class ExportEngine:
         entry = self.state.folder(folder.server_id, name=name, type_code=folder.type_code)
         exported: set[str] = set(entry["exported"])
         sync_key = entry.get("sync_key") or "0"
-        target_dir = Path(settings.out_dir) / "eml" / name
-        target_dir.mkdir(parents=True, exist_ok=True)
         LOGGER.info("→ %s（已有 %d 封，SyncKey=%s）", name, len(exported), sync_key)
 
         seen = 0
@@ -404,7 +521,7 @@ class ExportEngine:
                     self.state.record_failure(folder.server_id, item.server_id, reason)
                     LOGGER.warning("跳过 %s：%s", item.server_id, reason)
                     continue
-                self.write_eml(target_dir, name, item, mime)
+                self._save(item, name, mime)
                 exported.add(item.server_id)
                 seen += 1
                 new_items += 1
@@ -429,8 +546,7 @@ class ExportEngine:
             if page.more_available:
                 continue
             if passes == 1:
-                # 有的 Exchange 对 SyncKey=0 只做状态初始化，条目要下一轮才下发，
-                # 所以首轮为空也必须继续拉。
+                # 有的 Exchange 对 SyncKey=0 只做状态初始化，条目要下一轮才下发
                 continue
             if new_items == 0:
                 break
@@ -452,43 +568,20 @@ class ExportEngine:
         self.stats[name] = info
         LOGGER.info(
             "  ✓ %s：本次 %d 封（单独补取 %d），累计 %d 封，失败 %d，用时 %.1fs",
-            name,
-            seen,
-            fetched_extra,
-            len(exported),
-            failed,
-            time.time() - started,
+            name, seen, fetched_extra, len(exported), failed, time.time() - started,
         )
         self._emit(event="folder_done", folder=name, stats=info)
 
-    def write_eml(self, target_dir: Path, folder_path: str, item: SyncItem, mime: bytes) -> None:
-        # 元数据以邮件原文为准，EAS 摘要字段只作兜底
-        meta = mime_metadata(mime)
-        subject = meta.get("subject") or item.subject or ""
-        sender = meta.get("from") or item.sender or ""
-        stamp = meta.get("date") or re.sub(r"[^0-9]", "", item.date_received or "")[:14]
-        if not stamp:
-            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        base = eml_basename(stamp, sender, subject, item.server_id)
-        path = target_dir / f"{base}.eml"
-        counter = 1
-        while path.exists():
-            path = target_dir / f"{base}({counter}).eml"
-            counter += 1
-        path.write_bytes(mime)
-        self.index.add(
-            folder=folder_path,
-            server_id=item.server_id,
+    def _save(self, item: SyncItem, name: str, mime: bytes) -> None:
+        self.save_message(
+            name,
+            item.server_id,
+            mime,
             kind=item.kind,
-            date_received=item.date_received or "",
-            **{"from": sender},
-            subject=subject,
-            size_bytes=len(mime),
-            file=str(path.relative_to(Path(self.settings.out_dir))),
-            note=meta.get("message_id", ""),
+            date_hint=item.date_received or "",
+            subject_hint=item.subject or "",
+            sender_hint=item.sender or "",
         )
-
-    # --- 复核与报告 ---
 
     def verify(self, folders: list[Folder], paths: dict[str, str]) -> None:
         LOGGER.info("复核：检查各文件夹是否还有未导出的变更")
@@ -499,10 +592,7 @@ class ExportEngine:
                 continue
             try:
                 page = self.client.sync(
-                    folder.server_id,
-                    entry.get("sync_key", "0"),
-                    window_size=50,
-                    want_mime=True,
+                    folder.server_id, entry.get("sync_key", "0"), window_size=50, want_mime=True
                 )
             except EasError as exc:
                 LOGGER.warning("复核 %s 失败：%s", paths[folder.server_id], exc)
@@ -513,49 +603,305 @@ class ExportEngine:
         if pending == 0:
             LOGGER.info("  ✓ 所有文件夹都已同步到最新状态，无残留变更")
 
-    def write_report(self) -> Path:
+
+# ------------------------------------------------------------------- Zimbra 通道
+
+
+class ZimbraExportEngine(BaseExportEngine):
+    """Zimbra 通道：REST `?fmt=tgz` 整箱下载 + SOAP 列文件夹。"""
+
+    protocol_label = "Zimbra REST"
+    client_factory = ZimbraClient
+
+    def __init__(self, settings, password, **kwargs) -> None:
+        super().__init__(settings, password, **kwargs)
+        base_url, _eas = parse_server_url(settings.server_url)
+        self.base_url = base_url
+        self.client = self.client_factory(
+            base_url, settings.user, password, verify_tls=settings.verify_tls
+        )
+        self.folders: list[ZimbraFolder] = []
+
+    def list_folders(self) -> list[ZimbraFolder]:
+        """列邮件文件夹；自动发现失败时退回 Zimbra 默认文件夹名。"""
+        folders = self.client.list_folders()
+        if not folders:
+            folders = [ZimbraFolder(path=name, name=name) for name in DEFAULT_FOLDERS]
+            LOGGER.info("使用默认文件夹列表：%s", ", ".join(DEFAULT_FOLDERS))
+        extra = [ZimbraFolder(path=name.strip("/"), name=name.strip("/")) for name in self.settings.zimbra_folders]
+        known = {folder.path.lower() for folder in folders}
+        for folder in extra:
+            if folder.path and folder.path.lower() not in known:
+                folders.append(folder)
+                known.add(folder.path.lower())
+        self.folders = folders
+        LOGGER.info("邮件文件夹共 %d 个：", len(folders))
+        for folder in folders:
+            LOGGER.info(
+                "    %-36s %s",
+                folder.path,
+                f"服务器报告 {folder.total} 封" if folder.total is not None else "",
+            )
+        return folders
+
+    def probe(self) -> list[ZimbraFolder]:
+        return self.list_folders()
+
+    def run(self) -> dict:
         settings = self.settings
-        out_dir = Path(settings.out_dir)
-        total = sum(item.get("exported_total", 0) for item in self.stats.values())
-        now = sum(item.get("exported_now", 0) for item in self.stats.values())
-        failures = self.state.data.get("failures", {})
-        eml_dir = out_dir / "eml"
-        bytes_on_disk = sum(path.stat().st_size for path in eml_dir.rglob("*.eml")) if eml_dir.exists() else 0
-        lines = [
-            "# 邮箱导出报告",
-            "",
-            f"- 账号：`{settings.user}`",
-            f"- 入口：`{settings.server_url}`",
-            f"- 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- 协议版本：{self.state.data.get('protocol_version', settings.protocol_version)}",
-            "",
-            f"共导出 **{total}** 封（本次新增 {now} 封），磁盘占用 {bytes_on_disk / 1048576:.1f} MB，"
-            f"失败 {len(failures)} 条。",
-            "",
-            "| 文件夹 | 累计封数 | 本次新增 | 单独补取 | 失败 | 用时(s) |",
-            "| --- | ---: | ---: | ---: | ---: | ---: |",
-        ]
-        for name, info in sorted(self.stats.items()):
-            if "error" in info:
-                lines.append(f"| {name} | - | - | - | 出错 | - |")
-            else:
-                lines.append(
-                    f"| {name} | {info['exported_total']} | {info['exported_now']} | "
-                    f"{info['fetched_individually']} | {info['failed']} | {info['seconds']} |"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        LOGGER.info("目标账号：%s", settings.user)
+        LOGGER.info("导出目录：%s", self.out_dir)
+        LOGGER.info("Zimbra 站点：%s", self.base_url)
+
+        folders = self.list_folders()
+        if settings.only:
+            needles = [needle.lower() for needle in settings.only]
+            folders = [f for f in folders if any(n in f.path.lower() for n in needles)]
+        LOGGER.info("准备导出 %d 个邮件文件夹", len(folders))
+        self._emit(event="folders", total=len(folders), names=[f.path for f in folders])
+
+        for position, folder in enumerate(folders, start=1):
+            self._check_cancel()
+            self._emit(event="folder_start", folder=folder.path, index=position, total=len(folders))
+            try:
+                self.export_folder(folder, position, len(folders))
+            except ExportCancelled:
+                self.index.flush()
+                self.state.save()
+                self._emit(event="cancelled", stats=self.stats)
+                raise
+            except (ZimbraError, ZimbraAuthError) as exc:
+                if isinstance(exc, ZimbraAuthError):
+                    raise
+                LOGGER.error("文件夹 %s 导出出错：%s", folder.path, exc)
+                self.stats[folder.path] = {"error": str(exc)}
+                self._emit(event="folder_error", folder=folder.path, message=str(exc))
+
+        if settings.verify:
+            self._check_cancel()
+            self.verify()
+
+        self.index.flush()
+        self.state.save()
+        summary = self.build_summary(started)
+        self.write_report()
+        self._emit(event="done", stats=summary)
+        return summary
+
+    def export_folder(self, folder: ZimbraFolder, position: int, total: int) -> None:
+        settings = self.settings
+        key = f"zimbra:{folder.path}"
+        entry = self.state.folder(key, name=folder.path)
+        exported: set[str] = set(entry["exported"])
+        cache_dir = self.out_dir / ".zimbra-cache"
+        archive = cache_dir / f"{safe_name(folder.path.replace('/', '_'), 60)}.tgz"
+        started = time.time()
+        LOGGER.info("→ %s（已导出 %d 封）", folder.path, len(exported))
+
+        downloaded = 0
+
+        def on_progress(written: int) -> None:
+            nonlocal downloaded
+            downloaded = written
+            if written % (8 * 1024 * 1024) < 256 * 1024:
+                LOGGER.info("    下载中… %.1f MB", written / 1048576)
+            self._emit(
+                event="item",
+                folder=folder.path,
+                index=position,
+                total=total,
+                exported_now=len(exported),
+                exported_total=len(exported),
+            )
+
+        try:
+            size = self.client.fetch_folder_archive(folder.path, archive, progress=on_progress)
+            LOGGER.info("    已下载 %s（%.1f MB）", archive.name, size / 1048576)
+        except ZimbraAuthError:
+            raise
+        except ZimbraError as exc:
+            if folder.total == 0:
+                LOGGER.info("    %s：服务器报告为空文件夹，跳过（%s）", folder.path, exc)
+                self.stats[folder.path] = {
+                    "exported_total": 0, "exported_now": 0, "fetched_individually": 0,
+                    "failed": 0, "seconds": round(time.time() - started, 1),
+                }
+                self._emit(event="folder_done", folder=folder.path, stats=self.stats[folder.path])
+                return
+            raise
+
+        seen = 0
+        failed = 0
+        try:
+            for message_id, data in extract_messages(archive):
+                self._check_cancel()
+                if message_id in exported:
+                    continue
+                self.save_message(folder.path, message_id, data, kind="ZimbraRest")
+                exported.add(message_id)
+                seen += 1
+                if seen % 10 == 0:
+                    entry["exported"] = sorted(exported)
+                    self.state.save()
+                    self._emit(
+                        event="item",
+                        folder=folder.path,
+                        index=position,
+                        total=total,
+                        exported_now=seen,
+                        exported_total=len(exported),
+                    )
+        except ExportCancelled:
+            LOGGER.warning("已中止，未解包完成的压缩包保留在 %s", archive)
+            raise
+        except Exception as exc:
+            failed += 1
+            self.state.record_failure(key, "archive", f"解包失败：{exc}")
+            LOGGER.error("解包 %s 失败：%s", archive, exc)
+        finally:
+            entry["exported"] = sorted(exported)
+            entry["total_reported"] = folder.total
+            self.state.save()
+            try:
+                archive.unlink(missing_ok=True)
+            except Exception as exc:
+                LOGGER.debug("清理缓存文件失败：%s", exc)
+
+        info = {
+            "exported_total": len(exported),
+            "exported_now": seen,
+            "fetched_individually": 0,
+            "failed": failed,
+            "seconds": round(time.time() - started, 1),
+            "reported_total": folder.total,
+        }
+        self.stats[folder.path] = info
+        LOGGER.info(
+            "  ✓ %s：本次 %d 封，累计 %d 封%s，失败 %d，用时 %.1fs",
+            folder.path,
+            seen,
+            len(exported),
+            f"（服务器报告 {folder.total} 封）" if folder.total is not None else "",
+            failed,
+            time.time() - started,
+        )
+        if folder.total is not None and folder.total != len(exported):
+            LOGGER.warning(
+                "  ! %s：导出 %d 封与服务器报告的 %d 封不一致（可能有子文件夹或统计口径差异）",
+                folder.path, len(exported), folder.total,
+            )
+        self._emit(event="folder_done", folder=folder.path, stats=info)
+
+    def verify(self) -> None:
+        """复核：重新拉一次文件夹列表，比对服务器报告的条目数。"""
+        LOGGER.info("复核：重新获取文件夹列表并比对条目数")
+        try:
+            folders = self.client.list_folders() or []
+        except Exception as exc:
+            LOGGER.warning("复核失败：%s", exc)
+            return
+        mismatched = 0
+        for folder in folders:
+            info = self.stats.get(folder.path)
+            if not info or folder.total is None:
+                continue
+            if info.get("exported_total") != folder.total:
+                mismatched += 1
+                LOGGER.warning(
+                    "  %s：本地 %s 封，服务器报告 %s 封",
+                    folder.path, info.get("exported_total"), folder.total,
                 )
-        if failures:
-            lines += ["", "## 失败条目", ""]
-            for key, reason in sorted(failures.items()):
-                lines.append(f"- `{key}`：{reason}")
-        lines += [
-            "",
-            "## 文件说明",
-            "",
-            "- `eml/<文件夹路径>/*.eml`：每封邮件的原始 MIME，含全部邮件头与附件",
-            "- `index.csv`：索引（文件夹、服务器 ID、时间、发件人、主题、大小、文件路径）",
-            "- `state.json`：断点续传状态，重跑会自动续传（删掉它则从头再来）",
-            "",
-        ]
-        report = out_dir / "report.md"
-        report.write_text("\n".join(lines), encoding="utf-8")
-        return report
+        if mismatched == 0:
+            LOGGER.info("  ✓ 各文件夹封数与服务器报告一致")
+
+
+# --------------------------------------------------------------------- 选择通道
+
+
+class AutoExportEngine(BaseExportEngine):
+    """先试 ActiveSync；如果服务器根本没按 EAS 协议应答，就改走 Zimbra。"""
+
+    protocol_label = "自动选择"
+
+    def __init__(self, settings, password, **kwargs) -> None:
+        super().__init__(settings, password, **kwargs)
+        self.active: BaseExportEngine | None = None
+
+    def _make(self, backend: str):
+        engine_class = ZimbraExportEngine if backend == "zimbra" else ExportEngine
+        return engine_class(
+            self.settings,
+            self.password,
+            progress=self.progress,
+            cancel=self.cancel,
+        )
+
+    def probe(self):
+        """探测：ActiveSync 不行就换 Zimbra 再探测一次。"""
+        backend = self.settings.backend
+        if backend == "zimbra":
+            self.active = self._make("zimbra")
+            return self.active.probe()
+        if backend == "eas":
+            self.active = self._make("eas")
+            return self.active.probe()
+        eas_engine = self._make("eas")
+        try:
+            result = eas_engine.probe()
+            self.active = eas_engine
+            return result
+        except (NotEasResponse, EasAuthError) as exc:
+            LOGGER.warning("ActiveSync 探测失败（%s），改用 Zimbra 通道探测", exc)
+        self.active = self._make("zimbra")
+        return self.active.probe()
+
+    def run(self) -> dict:
+        backend = self.settings.backend
+        if backend == "zimbra":
+            self.active = self._make("zimbra")
+            return self.active.run()
+        if backend == "eas":
+            self.active = self._make("eas")
+            return self.active.run()
+
+        eas_engine = self._make("eas")
+        try:
+            summary = eas_engine.run()
+            self.active = eas_engine
+            return summary
+        except NotEasResponse as exc:
+            if eas_engine.stats:
+                # 已经导出过内容，说明中途出错，不再换通道（避免重复导出）
+                raise
+            LOGGER.warning("ActiveSync 未生效，自动改用 Zimbra 通道。原因：%s", exc)
+        except EasAuthError:
+            # 认证失败也可能是"这个端点不属于这个账号"，同样给 Zimbra 一次机会
+            if eas_engine.stats:
+                raise
+            LOGGER.warning("ActiveSync 认证失败，改试 Zimbra 通道")
+        self.active = self._make("zimbra")
+        LOGGER.info("改用 Zimbra 通道：%s", self.active.base_url)
+        return self.active.run()
+
+
+def create_engine(
+    settings: ExportSettings,
+    password: str,
+    *,
+    progress: Callable[[dict], None] | None = None,
+    cancel: threading.Event | None = None,
+) -> BaseExportEngine:
+    """按设置创建引擎。backend=auto 时先 EAS 后 Zimbra。"""
+    backend = (settings.backend or "auto").lower()
+    if backend not in ("auto", "eas", "zimbra"):
+        raise ValueError(f"未知通道：{settings.backend!r}")
+    if backend == "auto" and is_eas_url(settings.server_url):
+        pass  # 仍然先试 EAS
+    engine_class = {
+        "eas": ExportEngine,
+        "zimbra": ZimbraExportEngine,
+        "auto": AutoExportEngine,
+    }[backend]
+    return engine_class(settings, password, progress=progress, cancel=cancel)
