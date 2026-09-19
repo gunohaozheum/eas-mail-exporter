@@ -1,4 +1,4 @@
-"""把导出的 .eml 合并成 mbox，便于整箱导入其他邮件客户端。
+"""命令行方式生成 mbox（核心实现见 eas/mbox.py，GUI 里也有同样的按钮）。
 
 用法：
 
@@ -6,77 +6,21 @@
     python tools/build_mbox.py --out D:\\mail-export --per-folder     # 每个文件夹再单独出一个
     python tools/build_mbox.py --out D:\\mail-export --name all.mbox
 
-实现说明：直接按字节拼 mbox（mboxrd 变体），不重新序列化邮件，因此
-原始邮件头与附件一字不改；正文里以 "From " 开头的行会按规范转义成 ">From "。
-导入位置：Thunderbird（直接打开/导入 mbox）、Apple Mail（导入 mbox）、
-以及大多数支持 mbox 的客户端。Outlook 桌面版本身不支持 mbox，
-可以用 Thunderbird 打开后再转发/移动。
+导入位置：Thunderbird（直接打开/导入 mbox）、Apple Mail 等支持 mbox 的客户端。
+Windows 版 Outlook 本身不支持 mbox，可以先用 Thunderbird 打开再转发/移动。
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
-from datetime import datetime
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from eas.mime import mime_metadata  # noqa: E402
-
-FROM_QUOTE = re.compile(rb"(?m)^(>*From )")
-_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-
-
-def asctime(value: str) -> str:
-    """把 YYYYMMDDHHMMSS 转成 mbox 分隔行要求的 C 语言习惯格式（不依赖系统区域设置）。"""
-    try:
-        moment = datetime.strptime(value, "%Y%m%d%H%M%S")
-    except Exception:
-        return "Thu Jan  1 00:00:00 1970"
-    return (
-        f"{_DAYS[moment.weekday()]} {_MONTHS[moment.month - 1]} {moment.day:2d} "
-        f"{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d} {moment.year}"
-    )
-
-
-def mbox_separator(raw: bytes, fallback: str) -> bytes:
-    """生成 mbox 的分隔行：`From <发件人> <日期>`。"""
-    meta = mime_metadata(raw)
-    sender = meta.get("from") or fallback or "unknown@unknown"
-    match = re.search(r"[\w.+-]+@[\w.-]+", sender)
-    address = match.group(0) if match else "unknown@unknown"
-    stamp = meta.get("date")
-    when = asctime(stamp) if stamp else "Thu Jan  1 00:00:00 1970"
-    return f"From {address} {when}".encode("ascii", "replace")
-
-
-def iter_eml(directory: Path):
-    """按时间顺序（文件名前缀是时间戳）列出 .eml，导入后顺序更自然。"""
-    return sorted(path for path in directory.rglob("*.eml") if path.is_file())
-
-
-def build_mbox(files: list[Path], dest: Path) -> int:
-    """把若干 .eml 写成一个 mbox，返回写入的邮件数。"""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-    with open(dest, "wb") as out:
-        for path in files:
-            raw = path.read_bytes()
-            if not raw.strip():
-                continue
-            body = raw.replace(b"\r\n", b"\n")
-            body = FROM_QUOTE.sub(rb">\1", body)  # mboxrd：转义正文里的 "From "
-            out.write(mbox_separator(raw, path.stem) + b"\n")
-            out.write(body)
-            if not body.endswith(b"\n"):
-                out.write(b"\n")
-            out.write(b"\n")
-            count += 1
-    return count
+from eas.mbox import build_mbox, iter_eml  # noqa: E402
 
 
 def main() -> int:
@@ -98,10 +42,11 @@ def main() -> int:
         print(f"{eml_dir} 下没有 .eml 文件")
         return 1
 
+    started = time.time()
     combined = out_dir / args.name
     count = build_mbox(files, combined)
     size_mb = combined.stat().st_size / 1048576
-    print(f"已写出 {combined}（{count} 封，{size_mb:.1f} MB）")
+    print(f"已写出 {combined}（{count} 封，{size_mb:.1f} MB，用时 {time.time() - started:.1f}s）")
 
     if args.per_folder:
         target_dir = out_dir / args.mbox_dir
@@ -111,8 +56,7 @@ def main() -> int:
             if not folder_files:
                 continue
             relative = folder.relative_to(eml_dir)
-            name = "_".join(relative.parts) + ".mbox"
-            dest = target_dir / name
+            dest = target_dir / ("_".join(relative.parts) + ".mbox")
             written = build_mbox(folder_files, dest)
             print(f"  {relative} -> {dest.name}（{written} 封）")
     return 0

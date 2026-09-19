@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from eas.easclient import EasAuthError, EasError, NotEasResponse  # noqa: E402
 from eas.exporter import ExportCancelled, ExportSettings, create_engine  # noqa: E402
+from eas.mbox import build_mbox, iter_eml  # noqa: E402
 from eas.zimbra import ZimbraAuthError, ZimbraError  # noqa: E402
 
 APP_TITLE = "EAS 邮箱导出工具"
@@ -60,12 +61,13 @@ class ExportApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("880x640")
-        self.minsize(760, 560)
+        self.geometry("920x800")
+        self.minsize(800, 700)
 
         self.events: queue.Queue = queue.Queue()
         self.cancel_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self._drain_job: str | None = None
         self.started_at = 0.0
         self.last_folder = ""
         self.is_running = False
@@ -76,6 +78,7 @@ class ExportApp(tk.Tk):
         self.var_out = tk.StringVar(value=str(Path.home() / "mail-export"))
         self.var_verify = tk.BooleanVar(value=True)
         self.var_pim = tk.BooleanVar(value=False)
+        self.var_mbox_split = tk.BooleanVar(value=True)
         self.var_variants = tk.BooleanVar(value=False)
         self.var_insecure = tk.BooleanVar(value=False)
         self.var_window = tk.IntVar(value=100)
@@ -88,7 +91,17 @@ class ExportApp(tk.Tk):
         self._build_widgets()
         self.load_config()
         self._install_logging()
-        self.after(120, self._drain_events)
+        self._drain_job = self.after(120, self._drain_events)
+
+    def destroy(self) -> None:
+        """关窗前取消待执行的定时回调，否则会抛出 "invalid command name" 的 Tcl 错误。"""
+        if self._drain_job is not None:
+            try:
+                self.after_cancel(self._drain_job)
+            except Exception:
+                pass
+            self._drain_job = None
+        super().destroy()
 
     # ------------------------------------------------------------- 界面
 
@@ -172,6 +185,19 @@ class ExportApp(tk.Tk):
         self.btn_open = ttk.Button(buttons, text="打开导出目录", command=self.open_out_dir)
         self.btn_open.pack(side="right")
 
+        extra = ttk.LabelFrame(outer, text="其他操作（不需要账号密码）", padding=10)
+        extra.pack(fill="x", pady=(10, 0))
+        row = ttk.Frame(extra)
+        row.pack(fill="x")
+        ttk.Checkbutton(row, text="同时为每个文件夹单独生成一个", variable=self.var_mbox_split).pack(side="left")
+        self.btn_mbox = ttk.Button(extra, text="生成 mbox（便于整箱导入）", command=self.start_mbox)
+        self.btn_mbox.pack(in_=row, side="left", padx=8)
+        ttk.Label(
+            extra,
+            text="把导出目录里 eml/ 下的邮件合并成 mailbox.mbox（Thunderbird / Apple Mail 可直接导入）",
+            foreground="#666",
+        ).pack(anchor="w", pady=(6, 0))
+
         progress_frame = ttk.LabelFrame(outer, text="进度", padding=10)
         progress_frame.pack(fill="x", pady=(12, 0))
         progress_frame.columnconfigure(0, weight=1)
@@ -185,7 +211,7 @@ class ExportApp(tk.Tk):
 
         log_frame = ttk.LabelFrame(outer, text="日志", padding=6)
         log_frame.pack(fill="both", expand=True, pady=(12, 0))
-        self.log = tk.Text(log_frame, height=14, wrap="word", state="disabled", font=("Consolas", 9))
+        self.log = tk.Text(log_frame, height=10, wrap="word", state="disabled", font=("Consolas", 9))
         scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.pack(side="left", fill="both", expand=True)
@@ -389,6 +415,77 @@ class ExportApp(tk.Tk):
 
         self._run_in_thread(work, log_file=True)
 
+    def start_mbox(self) -> None:
+        """把导出目录里的 .eml 合并成 mbox（不需要账号密码）。"""
+        out_dir = Path(self.var_out.get().strip() or ".").expanduser()
+        eml_dir = out_dir / "eml"
+        if not eml_dir.exists():
+            messagebox.showwarning(
+                APP_TITLE,
+                f"没有找到 {eml_dir}\n\n请先在“导出目录”里选择已经导出过邮件的目录。",
+            )
+            return
+        files = iter_eml(eml_dir)
+        if not files:
+            messagebox.showwarning(APP_TITLE, f"{eml_dir} 下没有 .eml 文件")
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"将把 {len(files)} 封邮件合并成 mbox：\n\n{out_dir / 'mailbox.mbox'}\n\n"
+            "要继续吗？（体积约等于现有邮件的总大小）",
+        ):
+            return
+
+        self.save_config()
+        self._attach_file_log(out_dir, prefix="mbox")
+        self._set_running(True)
+        self.bar_activity.start(12)
+        self.bar_folders.configure(value=0, maximum=100)
+        self.var_status.set("正在生成 mbox…")
+        self.started_at = time.time()
+        self._last_exported, self._last_failed = 0, 0
+        split = bool(self.var_mbox_split.get())
+
+        def work() -> None:
+            try:
+                logging.info("开始生成 mbox：%d 封邮件，目录 %s", len(files), out_dir)
+                last_report = 0
+
+                def on_progress(done: int, total: int) -> None:
+                    nonlocal last_report
+                    if done - last_report >= 200 or done == total:
+                        last_report = done
+                        logging.info("  已合并 %d / %d", done, total)
+                        self.events.put(
+                            ("progress", {"event": "item", "folder": "生成 mbox",
+                                          "index": 1, "total": 1,
+                                          "exported_now": done, "exported_total": done})
+                        )
+
+                combined = out_dir / "mailbox.mbox"
+                count = build_mbox(files, combined, progress=on_progress)
+                results = [(combined, count)]
+                if split:
+                    target_dir = out_dir / "mbox"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    for folder in sorted(p for p in eml_dir.rglob("*") if p.is_dir()):
+                        folder_files = sorted(folder.glob("*.eml"))
+                        if not folder_files:
+                            continue
+                        relative = folder.relative_to(eml_dir)
+                        dest = target_dir / ("_".join(relative.parts) + ".mbox")
+                        written = build_mbox(folder_files, dest)
+                        logging.info("  %s -> %s（%d 封）", relative, dest.name, written)
+                        results.append((dest, written))
+                self.events.put(("mbox_done", {"files": [(str(p), n) for p, n in results]}))
+            except Exception as exc:
+                logging.exception("生成 mbox 失败")
+                self.events.put(("error", f"生成 mbox 失败：{exc}"))
+            finally:
+                self.events.put(("idle", None))
+
+        self._run_in_thread(work, log_file=True)
+
     def _run_in_thread(self, work, log_file: bool) -> None:
         self.cancel_event.clear()
         self.bar_activity.start(12)
@@ -414,7 +511,7 @@ class ExportApp(tk.Tk):
     def _set_running(self, running: bool) -> None:
         self.is_running = running
         state = "disabled" if running else "normal"
-        for widget in (self.btn_start, self.btn_probe):
+        for widget in (self.btn_start, self.btn_probe, self.btn_mbox):
             widget.configure(state=state)
         self.btn_stop.configure(state="normal" if running else "disabled")
 
@@ -436,7 +533,7 @@ class ExportApp(tk.Tk):
         except queue.Empty:
             pass
         finally:
-            self.after(120, self._drain_events)
+            self._drain_job = self.after(120, self._drain_events)
 
     def _handle_event(self, kind: str, payload: list) -> None:
         if kind == "log":
@@ -458,6 +555,8 @@ class ExportApp(tk.Tk):
             self.var_status.set(payload[0])
         elif kind == "probe_result":
             self.handle_probe_result(payload[0])
+        elif kind == "mbox_done":
+            self.handle_mbox_done(payload[0])
         elif kind == "idle":
             if self.is_running:
                 self._set_running(False)
@@ -482,6 +581,27 @@ class ExportApp(tk.Tk):
                 "连接成功，但服务器返回 0 个文件夹。\n\n"
                 "请把导出目录下 logs\\probe-*.log 发我，里面有服务器返回的原始信息。",
             )
+
+    def handle_mbox_done(self, info: dict) -> None:
+        files = info.get("files") or []
+        if not files:
+            return
+        lines = []
+        for path, count in files:
+            try:
+                size = Path(path).stat().st_size / 1048576
+            except Exception:
+                size = 0.0
+            lines.append(f"{Path(path).name}（{count} 封，{size:.1f} MB）")
+        self.var_status.set("mbox 生成完成")
+        self.append_log("mbox 生成完成：" + "；".join(lines), "INFO")
+        messagebox.showinfo(
+            APP_TITLE,
+            "mbox 生成完成：\n\n"
+            + "\n".join(lines)
+            + "\n\nThunderbird 可直接导入 mailbox.mbox；"
+              "Windows 版 Outlook 不支持 mbox，可先用 Thunderbird 打开。",
+        )
 
     def handle_progress(self, event: dict) -> None:
         name = event.get("event")

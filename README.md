@@ -103,6 +103,10 @@ part of the mapping. Recurrence rules are converted for the common cases
 
 ### Importing the result into another client
 
+In the GUI this is the **生成 mbox** button under “其他操作” — it needs no
+credentials, just a folder that already contains `eml/`. The command line
+equivalent:
+
 ```bash
 python tools/build_mbox.py --out "D:\\mail-export"                 # mailbox.mbox
 python tools/build_mbox.py --out "D:\\mail-export" --per-folder    # mbox/<folder>.mbox
@@ -291,6 +295,9 @@ Zimbra 通道直接用服务器原生格式（`?fmt=ics|vcf|json`）原样保存
 重复规则会转换常见类型（每天/每周/每月/每年），少见的类型保留在原始 JSON 里。
 
 ### 导入到其他邮件客户端
+
+图形界面里就是「其他操作」中的 **生成 mbox** 按钮——不需要账号密码，只要"导出目录"里
+已经有 `eml/` 就行。命令行等价写法：
 
 ```powershell
 python tools\build_mbox.py --out "D:\mail-export"                 # 生成 mailbox.mbox
