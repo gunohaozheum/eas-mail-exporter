@@ -35,8 +35,10 @@ from .easclient import (
     user_variants,
 )
 from .mime import mime_metadata
+from . import pim
 from .zimbra import (
     DEFAULT_FOLDERS,
+    ZIMBRA_FOLDER_FORMATS,
     ZimbraAuthError,
     ZimbraClient,
     ZimbraError,
@@ -194,6 +196,7 @@ class ExportSettings:
     verify_tls: bool = True
     only: list[str] = field(default_factory=list)
     zimbra_folders: list[str] = field(default_factory=list)
+    include_pim: bool = False
     max_items: int = 0
     verify: bool = True
     try_user_variants: bool = False
@@ -280,21 +283,27 @@ class BaseExportEngine:
 
     def build_summary(self, started: float) -> dict:
         eml_dir = self.out_dir / "eml"
+        mail_stats = {key: value for key, value in self.stats.items() if not value.get("pim")}
+        pim_stats = {key: value for key, value in self.stats.items() if value.get("pim")}
         return {
-            "exported": sum(item.get("exported_total", 0) for item in self.stats.values()),
-            "exported_now": sum(item.get("exported_now", 0) for item in self.stats.values()),
+            "exported": sum(item.get("exported_total", 0) for item in mail_stats.values()),
+            "exported_now": sum(item.get("exported_now", 0) for item in mail_stats.values()),
             "failed": len(self.state.data.get("failures", {})),
             "bytes": sum(path.stat().st_size for path in eml_dir.rglob("*.eml")) if eml_dir.exists() else 0,
             "seconds": round(time.time() - started, 1),
             "report": str(self.out_dir / "report.md"),
             "folders": dict(self.stats),
+            "pim_files": len(pim_stats),
+            "pim_items": sum(item.get("exported_total", 0) for item in pim_stats.values()),
             "backend": self.protocol_label,
         }
 
     def write_report(self) -> Path:
         settings = self.settings
-        total = sum(item.get("exported_total", 0) for item in self.stats.values())
-        now = sum(item.get("exported_now", 0) for item in self.stats.values())
+        mail_stats = {key: value for key, value in self.stats.items() if not value.get("pim")}
+        pim_stats = {key: value for key, value in self.stats.items() if value.get("pim")}
+        total = sum(item.get("exported_total", 0) for item in mail_stats.values())
+        now = sum(item.get("exported_now", 0) for item in mail_stats.values())
         failures = self.state.data.get("failures", {})
         eml_dir = self.out_dir / "eml"
         bytes_on_disk = sum(path.stat().st_size for path in eml_dir.rglob("*.eml")) if eml_dir.exists() else 0
@@ -312,7 +321,7 @@ class BaseExportEngine:
             "| 文件夹 | 累计封数 | 本次新增 | 单独补取 | 失败 | 用时(s) |",
             "| --- | ---: | ---: | ---: | ---: | ---: |",
         ]
-        for name, info in sorted(self.stats.items()):
+        for name, info in sorted(mail_stats.items()):
             if "error" in info:
                 lines.append(f"| {name} | - | - | - | 出错 | - |")
             else:
@@ -320,6 +329,20 @@ class BaseExportEngine:
                     f"| {name} | {info.get('exported_total', 0)} | {info.get('exported_now', 0)} | "
                     f"{info.get('fetched_individually', 0)} | {info.get('failed', 0)} | {info.get('seconds', 0)} |"
                 )
+        if pim_stats:
+            lines += [
+                "",
+                "## 其他数据（日历 / 联系人 / 任务 / 便笺）",
+                "",
+                "| 文件夹 | 条数 | 格式 | 输出 |",
+                "| --- | ---: | --- | --- |",
+            ]
+            for name, info in sorted(pim_stats.items()):
+                if "error" in info:
+                    lines.append(f"| {name} | - | - | 出错：{info['error']} |")
+                else:
+                    fmt = (info.get("format") or "").lower()
+                    lines.append(f"| {name} | {info.get('exported_total', 0)} | {info.get('format', '')} | `pim/{name}.{fmt}` |")
         if failures:
             lines += ["", "## 失败条目", ""]
             for key, reason in sorted(failures.items()):
@@ -329,6 +352,7 @@ class BaseExportEngine:
             "## 文件说明",
             "",
             "- `eml/<文件夹路径>/*.eml`：每封邮件的原始 MIME，含全部邮件头与附件",
+            "- `pim/*.ics|.vcf|.json`：日历/联系人/任务/便笺（`--pim` 时生成；ICS/vCard 另附 `.raw.json` 原始属性）",
             "- `index.csv`：索引（文件夹、服务器 ID、时间、发件人、主题、大小、文件路径）",
             "- `state.json`：断点续传状态，重跑会自动续传（删掉它则从头再来）",
             "",
@@ -353,6 +377,27 @@ class BaseExportEngine:
                 "本次没有导出任何邮件。请回看上面的日志：服务器是否返回了文件夹？"
                 "通道和账号是否正确？"
             )
+
+    def write_pim_file(self, folder_name: str, props_list: list[dict], uids: list[str], fmt: str, kind: str):
+        """把一批 PIM 条目写成 ICS/vCard/JSON（外加一份原始属性 JSON）。"""
+        target_dir = self.out_dir / "pim"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        base = safe_name(folder_name, 60)
+        path = target_dir / f"{base}{pim.EXTENSIONS[fmt]}"
+        content = pim.build(fmt, props_list, uids, kind)
+        path.write_text(content, encoding="utf-8")
+        raw_path = None
+        if fmt != "json":
+            # ICS/vCard 是"尽力而为"的转换，原始属性另存一份以免丢信息
+            raw_path = target_dir / f"{base}.raw.json"
+            raw_path.write_text(pim.build_json(props_list, uids), encoding="utf-8")
+        LOGGER.info(
+            "    ✓ 已写出 %s（%d 条%s）",
+            path.name,
+            len(props_list),
+            f"，原始属性见 {raw_path.name}" if raw_path else "",
+        )
+        return path
 
     def state_matches_disk(self, folder_path: str, entry: dict) -> bool:
         """检查 state 记录的"已导出"与磁盘上的文件是否对得上。
@@ -470,9 +515,21 @@ class ExportEngine(BaseExportEngine):
                 folder for folder in targets
                 if any(needle in paths[folder.server_id].lower() for needle in needles)
             ]
-        skipped = [folder for folder in folders if folder not in targets]
+        pim_targets = [
+            folder
+            for folder in folders
+            if settings.include_pim
+            and not folder.is_mail
+            and folder.type_code in pim.EAS_FOLDER_FORMATS
+            and (not settings.only or any(n in paths[folder.server_id].lower() for n in [needle.lower() for needle in settings.only]))
+        ]
+        skipped = [folder for folder in folders if folder not in targets and folder not in pim_targets]
         if skipped:
-            LOGGER.info("跳过 %d 个非邮件文件夹（日历/联系人/任务等）", len(skipped))
+            LOGGER.info(
+                "跳过 %d 个非邮件文件夹（日历/联系人/任务等）%s",
+                len(skipped),
+                "" if settings.include_pim else "；需要的话加 --pim（GUI 里勾选对应选项）一起导出",
+            )
         if not targets:
             LOGGER.warning(
                 "没有找到任何邮件文件夹（服务器共返回 %d 个文件夹）。账号、通道或服务器设置可能不对。",
@@ -492,6 +549,17 @@ class ExportEngine(BaseExportEngine):
                 self.state.save(self.client)
                 self._emit(event="cancelled", stats=self.stats)
                 raise
+            except EasError as exc:
+                LOGGER.error("文件夹 %s 导出出错：%s", name, exc)
+                self.stats[name] = {"error": str(exc)}
+                self._emit(event="folder_error", folder=name, message=str(exc))
+
+        for position, folder in enumerate(pim_targets, start=1):
+            self._check_cancel()
+            name = paths[folder.server_id]
+            self._emit(event="folder_start", folder=name, index=position, total=len(pim_targets))
+            try:
+                self.export_pim_folder(folder, name)
             except EasError as exc:
                 LOGGER.error("文件夹 %s 导出出错：%s", name, exc)
                 self.stats[name] = {"error": str(exc)}
@@ -639,6 +707,74 @@ class ExportEngine(BaseExportEngine):
             sender_hint=item.sender or "",
         )
 
+    def export_pim_folder(self, folder: Folder, name: str) -> None:
+        """导出日历/联系人/任务/便笺这类非邮件文件夹。"""
+        settings = self.settings
+        fmt = pim.EAS_FOLDER_FORMATS[folder.type_code]
+        kind = "tasks" if folder.type_code == 7 else "calendar"
+        entry = self.state.folder(f"pim:{folder.server_id}", name=name, type_code=folder.type_code)
+        sync_key = entry.get("sync_key") or "0"
+        LOGGER.info("→ %s（%s 格式，SyncKey=%s）", name, fmt.upper(), sync_key)
+
+        props_list: list[dict] = []
+        uids: list[str] = []
+        passes = 0
+        started = time.time()
+        while True:
+            self._check_cancel()
+            passes += 1
+            if passes > 500:
+                raise EasError(f"{name}：连续同步 500 轮仍未结束，已中止以免死循环")
+            page = self.client.sync(
+                folder.server_id, sync_key, window_size=settings.window_size, want_mime=False
+            )
+            if page.status == "3":
+                LOGGER.warning("%s：SyncKey 失效，从头重新同步", name)
+                sync_key = "0"
+                entry["sync_key"] = "0"
+                props_list, uids = [], []
+                continue
+            if page.status != "1":
+                raise EasError(f"{name}：Sync 状态 {page.status}")
+            previous_key = sync_key
+            new_items = 0
+            for item in page.items:
+                if item.kind in ("Delete", "SoftDelete"):
+                    continue
+                app = item.raw.child("ApplicationData")
+                props = pim.node_to_dict(app) if app is not None else {}
+                if not props:
+                    continue
+                props_list.append(props)
+                uids.append(item.server_id)
+                new_items += 1
+            sync_key = page.sync_key
+            entry["sync_key"] = sync_key
+            entry["count"] = len(props_list)
+            self.state.save(self.client)
+            if page.more_available:
+                continue
+            if passes == 1:
+                continue
+            if new_items == 0:
+                break
+            if sync_key == previous_key:
+                break
+
+        self.write_pim_file(name, props_list, uids, fmt, kind)
+        info = {
+            "exported_total": len(props_list),
+            "exported_now": len(props_list),
+            "fetched_individually": 0,
+            "failed": 0,
+            "seconds": round(time.time() - started, 1),
+            "format": fmt.upper(),
+            "pim": True,
+        }
+        self.stats[name] = info
+        LOGGER.info("  ✓ %s：%d 条（%s），用时 %.1fs", name, len(props_list), fmt.upper(), time.time() - started)
+        self._emit(event="folder_done", folder=name, stats=info)
+
     def verify(self, folders: list[Folder], paths: dict[str, str]) -> None:
         LOGGER.info("复核：检查各文件夹是否还有未导出的变更")
         pending = 0
@@ -715,16 +851,28 @@ class ZimbraExportEngine(BaseExportEngine):
         if settings.only:
             needles = [needle.lower() for needle in settings.only]
             folders = [f for f in folders if any(n in f.path.lower() for n in needles)]
+        mail_folders = [f for f in folders if f.view == "message"]
+        pim_folders = [
+            f for f in folders if settings.include_pim and f.view in ZIMBRA_FOLDER_FORMATS
+        ]
         if not folders:
             LOGGER.warning("没有可导出的文件夹，请检查账号、通道和服务器设置。")
-        LOGGER.info("准备导出 %d 个邮件文件夹", len(folders))
-        self._emit(event="folders", total=len(folders), names=[f.path for f in folders])
+        LOGGER.info(
+            "准备导出 %d 个邮件文件夹%s",
+            len(mail_folders),
+            f"，另有 {len(pim_folders)} 个日历/联系人等文件夹" if pim_folders else "",
+        )
+        self._emit(
+            event="folders", total=len(mail_folders), names=[f.path for f in mail_folders]
+        )
 
-        for position, folder in enumerate(folders, start=1):
+        for position, folder in enumerate(mail_folders, start=1):
             self._check_cancel()
-            self._emit(event="folder_start", folder=folder.path, index=position, total=len(folders))
+            self._emit(
+                event="folder_start", folder=folder.path, index=position, total=len(mail_folders)
+            )
             try:
-                self.export_folder(folder, position, len(folders))
+                self.export_folder(folder, position, len(mail_folders))
             except ExportCancelled:
                 self.index.flush()
                 self.state.save()
@@ -736,6 +884,16 @@ class ZimbraExportEngine(BaseExportEngine):
                 LOGGER.error("文件夹 %s 导出出错：%s", folder.path, exc)
                 self.stats[folder.path] = {"error": str(exc)}
                 self._emit(event="folder_error", folder=folder.path, message=str(exc))
+
+        for folder in pim_folders:
+            self._check_cancel()
+            try:
+                self.export_pim_folder(folder)
+            except (ZimbraError, ZimbraAuthError) as exc:
+                if isinstance(exc, ZimbraAuthError):
+                    raise
+                LOGGER.error("文件夹 %s 导出出错：%s", folder.path, exc)
+                self.stats[folder.path] = {"error": str(exc)}
 
         if settings.verify:
             self._check_cancel()
@@ -864,6 +1022,38 @@ class ZimbraExportEngine(BaseExportEngine):
                 "  ! %s：导出 %d 封与服务器报告的 %d 封不一致（可能有子文件夹或统计口径差异）",
                 folder.path, len(exported), folder.total,
             )
+        self._emit(event="folder_done", folder=folder.path, stats=info)
+
+    def export_pim_folder(self, folder: ZimbraFolder) -> None:
+        """Zimbra 的日历/联系人/任务/便笺：直接按原生格式下载。"""
+        fmt, extension = ZIMBRA_FOLDER_FORMATS[folder.view]
+        entry = self.state.folder(f"zimbra-pim:{folder.path}", name=folder.path)
+        target_dir = self.out_dir / "pim"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"{safe_name(folder.path.replace('/', '_'), 60)}{extension}"
+        LOGGER.info("→ %s（%s 格式）", folder.path, fmt.upper())
+        started = time.time()
+        size = self.client.download_folder(folder.path, fmt, path)
+        entry["format"] = fmt
+        entry["size"] = size
+        self.state.save()
+        info = {
+            "exported_total": 1,
+            "exported_now": 1,
+            "fetched_individually": 0,
+            "failed": 0,
+            "seconds": round(time.time() - started, 1),
+            "format": fmt.upper(),
+            "pim": True,
+        }
+        self.stats[folder.path] = info
+        LOGGER.info(
+            "  ✓ %s：已写出 %s（%.1f KB，%s 格式）",
+            folder.path,
+            path.name,
+            size / 1024,
+            fmt.upper(),
+        )
         self._emit(event="folder_done", folder=folder.path, stats=info)
 
     def verify(self) -> None:

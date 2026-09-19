@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 from eas import wbxml  # noqa: E402
 from eas.easclient import EasClient, HttpResponse, NotEasResponse  # noqa: E402
 from eas.exporter import ExportSettings, create_engine  # noqa: E402
-from eas.wbxml import FolderHierarchy, E  # noqa: E402
+from eas.wbxml import AirSync, Calendar, FolderHierarchy, E  # noqa: E402
 from eas.easclient import EasError  # noqa: E402
 from eas.zimbra import (  # noqa: E402
     ZimbraAuthError,
@@ -161,10 +161,13 @@ def test_zimbra_folder_discovery() -> None:
     folders = client.list_folders()
     assert folders is not None
     paths = [folder.path for folder in folders]
-    assert paths == ["Inbox", "Sent", "Trash", "Projects", "Projects/2026"], paths
+    # 现在会把日历/联系人这类文件夹也列出来（供 --pim 使用），视图信息一并带上
+    assert paths == ["Inbox", "Sent", "Calendar", "Trash", "Projects", "Projects/2026"], paths
     assert all(isinstance(folder, ZimbraFolder) for folder in folders)
     inbox = next(folder for folder in folders if folder.path == "Inbox")
     assert inbox.total == 2
+    assert inbox.view == "message"
+    assert next(f for f in folders if f.path == "Calendar").view == "appointment"
 
 
 def test_zimbra_array_wrapped_responses() -> None:
@@ -206,7 +209,8 @@ def test_zimbra_array_wrapped_responses() -> None:
     folders = client.list_folders()
     assert folders is not None, "数组包裹的响应不该导致退回默认文件夹名"
     paths = [folder.path for folder in folders]
-    assert paths == ["Inbox", "Projects", "Projects/2026"], paths
+    # Calendar（appointment）也会被列出，供 --pim 使用
+    assert paths == ["Inbox", "Projects", "Projects/2026", "Calendar"], paths
     assert next(f for f in folders if f.path == "Inbox").total == 3
 
 
@@ -264,7 +268,7 @@ def test_user_root_is_not_part_of_folder_path() -> None:
     folders = client.list_folders()
     assert folders is not None
     paths = [folder.path for folder in folders]
-    assert paths == ["Chats", "Drafts", "Inbox", "Projects", "Projects/2026"], paths
+    assert paths == ["Chats", "Drafts", "Inbox", "Projects", "Projects/2026", "Calendar"], paths
     assert not any(path.startswith("USER_ROOT") for path in paths)
     assert next(f for f in folders if f.path == "Inbox").total == 246
     # 生成的 REST 地址也必须直接是 /home/<账号>/Inbox
@@ -515,6 +519,158 @@ def test_auto_falls_back_when_449_is_html() -> None:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ------------------------------------------------------------------ PIM 导出
+
+
+def _eas_pim_handler(method, url, body):
+    folder_payload = wbxml.encode(
+        E(
+            FolderHierarchy.FolderSync,
+            E(FolderHierarchy.Status, "1"),
+            E(FolderHierarchy.SyncKey, "1"),
+            E(
+                FolderHierarchy.Changes,
+                E(FolderHierarchy.Count, "2"),
+                E(
+                    FolderHierarchy.Add,
+                    E(FolderHierarchy.ServerId, "11"),
+                    E(FolderHierarchy.ParentId, "0"),
+                    E(FolderHierarchy.DisplayName, "收件箱"),
+                    E(FolderHierarchy.Type, "2"),
+                ),
+                E(
+                    FolderHierarchy.Add,
+                    E(FolderHierarchy.ServerId, "9"),
+                    E(FolderHierarchy.ParentId, "0"),
+                    E(FolderHierarchy.DisplayName, "日历"),
+                    E(FolderHierarchy.Type, "8"),
+                ),
+            ),
+        )
+    )
+    empty_sync = wbxml.encode(
+        E(
+            AirSync.Sync,
+            E(
+                AirSync.Collections,
+                E(
+                    AirSync.Collection,
+                    E(AirSync.SyncKey, "1"),
+                    E(AirSync.CollectionId, "11"),
+                    E(AirSync.Status, "1"),
+                    E(AirSync.Commands),
+                ),
+            ),
+        )
+    )
+    calendar_sync = wbxml.encode(
+        E(
+            AirSync.Sync,
+            E(
+                AirSync.Collections,
+                E(
+                    AirSync.Collection,
+                    E(AirSync.SyncKey, "1"),
+                    E(AirSync.CollectionId, "9"),
+                    E(AirSync.Status, "1"),
+                    E(
+                        AirSync.Commands,
+                        E(
+                            AirSync.Add,
+                            E(AirSync.ServerId, "9:1"),
+                            E(
+                                AirSync.ApplicationData,
+                                E(Calendar.UID, "event-1"),
+                                E(Calendar.Subject, "家长会"),
+                                E(Calendar.Location, "线上"),
+                                E(Calendar.StartTime, "20260920T100000Z"),
+                                E(Calendar.EndTime, "20260920T110000Z"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+    )
+    if method == "OPTIONS":
+        return HttpResponse(200, {"MS-ASProtocolVersions": "16.1"}, b"")
+    if "Cmd=FolderSync" in url:
+        return HttpResponse(200, {"Content-Type": "application/vnd.ms-sync.wbxml"}, folder_payload)
+    if "Cmd=Sync" in url:
+        node = wbxml.decode(body)
+        collection = node.path("Collections", "Collection")
+        if collection is not None and collection.text_of("CollectionId") == "9":
+            return HttpResponse(200, {}, calendar_sync)
+        return HttpResponse(200, {}, empty_sync)
+    return HttpResponse(404, {}, b"")
+
+
+def test_eas_pim_exports_calendar_as_ics() -> None:
+    """开启 --pim 后，EAS 通道会把日历文件夹导成 ICS。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "eas-pim"
+    settings = ExportSettings(
+        server_url="https://mail.example.com",
+        user="u@example.com",
+        out_dir=out_dir,
+        include_pim=True,
+    )
+    engine = create_engine(settings, "pw")
+    module = _install_fake_backends(_eas_pim_handler)
+    try:
+        summary = engine.run()
+        ics = out_dir / "pim" / "日历.ics"
+        assert ics.exists(), [p.name for p in (out_dir / "pim").glob("*")] if (out_dir / "pim").exists() else "no pim dir"
+        text = ics.read_text(encoding="utf-8")
+        assert "BEGIN:VEVENT" in text and "SUMMARY:家长会" in text
+        assert "DTSTART:20260920T100000Z" in text
+        # 同时保留原始属性 JSON，便于需要时自行取用
+        assert (out_dir / "pim" / "日历.raw.json").exists()
+        assert "日历" in summary["folders"]
+    finally:
+        module.ExportEngine.client_factory = staticmethod(EasClient)
+        module.ZimbraExportEngine.client_factory = staticmethod(ZimbraClient)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_zimbra_pim_downloads_native_format() -> None:
+    """Zimbra 的日历直接按原生 ICS 下载。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "zimbra-pim"
+    settings = ExportSettings(
+        server_url="https://mail.example.edu.cn",
+        user="u@example.edu.cn",
+        out_dir=out_dir,
+        backend="zimbra",
+        include_pim=True,
+    )
+    engine = create_engine(settings, "pw")
+    engine.client = ZimbraClient(settings.server_url, settings.user, "pw")
+    engine.client.transport = FakeTransport(
+        soap_handler,
+        downloads={
+            "/Projects/2026": make_tgz({"301.eml": MAIL_1}),
+            "/Projects": make_tgz({}),
+            "/Inbox": make_tgz({"101.eml": MAIL_1, "102.eml": MAIL_2}),
+            "/Sent": make_tgz({"201.eml": MAIL_2}),
+            "/Trash": make_tgz({}),
+            "/Calendar": b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:\xe5\xae\xb6\xe9\x95\xbf\xe4\xbc\x9a\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        },
+    )
+    try:
+        summary = engine.run()
+        ics = out_dir / "pim" / "Calendar.ics"
+        assert ics.exists(), sorted(p.name for p in (out_dir / "pim").glob("*"))
+        assert "SUMMARY:" in ics.read_text(encoding="utf-8")
+        assert "Calendar" in summary["folders"]
+        # 邮件照常导出
+        assert summary["exported"] == 4
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def test_normal_wbxml_still_decodes() -> None:
     """正常 WBXML 响应不受影响。"""
     payload = wbxml.encode(
@@ -659,3 +815,7 @@ if __name__ == "__main__":
     print("认证失败不回退         ✓")
     test_auto_falls_back_when_449_is_html()
     print("449+网页时自动回退     ✓")
+    test_eas_pim_exports_calendar_as_ics()
+    print("EAS 日历 -> ICS       ✓")
+    test_zimbra_pim_downloads_native_format()
+    print("Zimbra 原生 ICS        ✓")

@@ -14,6 +14,7 @@ refs/
 __pycache__/
 *.py[cod]
 .tmp-test/
+.tmp-test-*/
 .venv/
 venv/
 env/

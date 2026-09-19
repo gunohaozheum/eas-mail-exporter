@@ -75,6 +75,7 @@ class ExportApp(tk.Tk):
         self.var_password = tk.StringVar()
         self.var_out = tk.StringVar(value=str(Path.home() / "mail-export"))
         self.var_verify = tk.BooleanVar(value=True)
+        self.var_pim = tk.BooleanVar(value=False)
         self.var_variants = tk.BooleanVar(value=False)
         self.var_insecure = tk.BooleanVar(value=False)
         self.var_window = tk.IntVar(value=100)
@@ -148,6 +149,11 @@ class ExportApp(tk.Tk):
         ttk.Checkbutton(options, text="跳过 TLS 证书校验（证书异常时才勾）", variable=self.var_insecure).grid(
             row=2, column=0, sticky="w"
         )
+        ttk.Checkbutton(
+            options,
+            text="同时导出日历/联系人/任务/便笺（ICS / vCard / JSON）",
+            variable=self.var_pim,
+        ).grid(row=3, column=0, sticky="w")
         ttk.Label(options, text="每页条目数").grid(row=0, column=1, sticky="e", padx=(20, 4))
         ttk.Spinbox(options, from_=20, to=500, increment=20, width=6, textvariable=self.var_window).grid(
             row=0, column=2, sticky="w"
@@ -208,6 +214,7 @@ class ExportApp(tk.Tk):
         self.var_backend.set(config.get("backend", self.var_backend.get()))
         self.var_window.set(int(config.get("window_size", self.var_window.get())))
         self.var_verify.set(bool(config.get("verify", True)))
+        self.var_pim.set(bool(config.get("include_pim", False)))
         self.var_variants.set(bool(config.get("try_user_variants", False)))
 
     def save_config(self) -> None:
@@ -224,6 +231,7 @@ class ExportApp(tk.Tk):
                         "backend": self.var_backend.get(),
                         "window_size": int(self.var_window.get() or 100),
                         "verify": bool(self.var_verify.get()),
+                        "include_pim": bool(self.var_pim.get()),
                         "try_user_variants": bool(self.var_variants.get()),
                     },
                     ensure_ascii=False,
@@ -287,6 +295,7 @@ class ExportApp(tk.Tk):
             window_size=int(self.var_window.get() or 100),
             verify_tls=not self.var_insecure.get(),
             verify=bool(self.var_verify.get()),
+            include_pim=bool(self.var_pim.get()),
             try_user_variants=bool(self.var_variants.get()),
         )
 
@@ -532,6 +541,12 @@ class ExportApp(tk.Tk):
             f"用时 {summary.get('seconds', 0):.0f} 秒\n\n"
             f"报告：{summary.get('report')}"
         )
+        if summary.get("pim_files"):
+            text = text.replace(
+                "\n\n报告：",
+                f"\n另有日历/联系人等 {summary.get('pim_files')} 个文件"
+                f"（共 {summary.get('pim_items')} 条）\n\n报告：",
+            )
         self.append_log(text.replace("\n", " "), "INFO")
         if messagebox.askyesno(APP_TITLE, text + "\n\n要打开导出目录吗？"):
             self.open_out_dir()

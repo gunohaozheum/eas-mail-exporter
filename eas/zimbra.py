@@ -25,6 +25,7 @@ from typing import Callable, Iterator
 
 from .easclient import EasError, HttpTransport
 from .mime import looks_like_mime
+from .pim import ZIMBRA_FOLDER_FORMATS
 
 LOGGER = logging.getLogger("zimbra")
 
@@ -291,7 +292,7 @@ class ZimbraClient:
                 path = path_of(node, prefix)
                 name = raw_name or path.rsplit("/", 1)[-1]
                 view = first(node.get("view")) or ""
-                if view == "message" and path:
+                if view in ("message", *ZIMBRA_FOLDER_FORMATS.keys()) and path:
                     total = None
                     for key in ("n", "total"):
                         value = first(node.get(key))
@@ -335,6 +336,29 @@ class ZimbraClient:
                 raise ZimbraAuthError(
                     f"下载文件夹时认证被拒（HTTP 401）：账号 {self.user!r} 或密码没被接受。"
                 ) from exc
+            if "HTTP 404" in message:
+                raise ZimbraFolderMissing(f"服务器上没有这个文件夹：{folder_path}") from exc
+            raise ZimbraError(message) from exc
+
+    def download_folder(
+        self,
+        folder_path: str,
+        fmt: str,
+        dest: Path,
+        *,
+        progress: Callable[[int], None] | None = None,
+    ) -> int:
+        """按指定格式（ics / vcf / json）下载整个文件夹。"""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        url = self.folder_url(folder_path, fmt)
+        try:
+            return self.transport.download(
+                url, dest, headers=self._headers(), timeout=self.timeout, progress=progress
+            )
+        except EasError as exc:
+            message = str(exc)
+            if "HTTP 401" in message:
+                raise ZimbraAuthError(f"下载 {folder_path} 时认证被拒（HTTP 401）") from exc
             if "HTTP 404" in message:
                 raise ZimbraFolderMissing(f"服务器上没有这个文件夹：{folder_path}") from exc
             raise ZimbraError(message) from exc

@@ -57,6 +57,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         help="Zimbra 通道下额外导出的文件夹路径（可重复；默认自动发现）",
     )
+    parser.add_argument(
+        "--pim",
+        action="store_true",
+        help="同时导出日历/联系人/任务/便笺（ICS / vCard / JSON，写入 pim/ 目录）",
+    )
     parser.add_argument("--probe", action="store_true", help="只探测：列出版本与文件夹树后退出")
     parser.add_argument("--only", action="append", help="只处理路径包含该子串的文件夹（可重复）")
     parser.add_argument("--window-size", type=int, default=100, help="每页条目数（默认 100）")
@@ -89,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         verify_tls=not args.insecure,
         only=args.only or [],
         zimbra_folders=args.zimbra_folder or [],
+        include_pim=args.pim,
         max_items=args.max_items,
         verify=not args.no_verify,
         try_user_variants=args.try_user_variants,
@@ -126,11 +132,14 @@ def main(argv: list[str] | None = None) -> int:
         return 130
 
     logging.info(
-        "完成（%s）：共 %d 封（本次新增 %d），失败 %d 条，用时 %.0f 秒",
+        "完成（%s）：共 %d 封（本次新增 %d），失败 %d 条%s，用时 %.0f 秒",
         summary.get("backend", "?"),
         summary["exported"],
         summary["exported_now"],
         summary["failed"],
+        f"，另有日历/联系人等 {summary['pim_files']} 个文件（{summary['pim_items']} 条）"
+        if summary.get("pim_files")
+        else "",
         summary["seconds"],
     )
     logging.info("汇总报告：%s", summary["report"])

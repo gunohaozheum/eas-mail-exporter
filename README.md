@@ -43,6 +43,13 @@ stays open because phones rely on it.
 * **Self-checking** — after the export it re-syncs every folder and reports whether
   any change is still pending. `tools/verify_export.py` re-reads every `.eml` file
   and validates headers, duplicates and index consistency.
+* **Calendar / contacts / tasks / notes** — with `--pim` (or the GUI checkbox) the
+  non-mail folders are exported too: ICS for calendars and tasks, vCard for
+  contacts, JSON for notes. Zimbra serves these natively; for ActiveSync the common
+  fields are mapped and the raw properties are kept in a `.raw.json` next to it.
+* **mbox for importing** — `tools/build_mbox.py` merges the exported `.eml` files
+  into one mbox (or one per folder) so another mail client can import the whole
+  mailbox in one go.
 
 ### Requirements
 
@@ -74,7 +81,38 @@ ActiveSync entry point is derived automatically.
 
 Useful flags: `--backend auto|eas|zimbra` (default `auto`), `--only 收件箱`,
 `--zimbra-folder "Projects/2026"`, `--window-size 100`, `--no-verify`,
-`--insecure`, `--verbose`.
+`--pim` (also export calendar/contacts/tasks/notes), `--insecure`, `--verbose`.
+
+### Other data (calendar, contacts, tasks, notes)
+
+Add `--pim` (GUI: tick the checkbox) to export the non-mail folders as well. They
+land in `pim/`:
+
+| Folder type | Output | Notes |
+| --- | --- | --- |
+| Calendar | `<name>.ics` | VEVENTs; all-day events use `VALUE=DATE` |
+| Tasks | `<name>.ics` | VTODOs with status/priority/due date |
+| Contacts | `<name>.vcf` | vCard 3.0 (name, org, title, emails, phones, addresses, birthday, note) |
+| Notes / journal | `<name>.json` | raw properties as JSON |
+
+Zimbra serves these natively (`?fmt=ics|vcf|json`) — the file is stored as-is. For
+ActiveSync the tool maps the common fields itself and writes the untouched
+properties to `<name>.raw.json` next to it, so nothing is lost if a field is not
+part of the mapping. Recurrence rules are converted for the common cases
+(daily/weekly/monthly/yearly); exotic ones are kept in the raw JSON.
+
+### Importing the result into another client
+
+```bash
+python tools/build_mbox.py --out "D:\\mail-export"                 # mailbox.mbox
+python tools/build_mbox.py --out "D:\\mail-export" --per-folder    # mbox/<folder>.mbox
+```
+
+The mbox is written byte-for-byte (mboxrd quoting for lines starting with `From `),
+verified by a test that reads it back with Python's `mailbox` module. Thunderbird
+and Apple Mail can import mbox directly; Outlook for Windows cannot, but you can
+open the mbox in Thunderbird and move the messages from there. `.eml` files can
+also be dragged into most clients individually.
 
 ### Channels
 
@@ -105,6 +143,8 @@ against Zimbra with the same wrong password — that only buries the real error.
 ```
 <output folder>/
 ├─ eml/<folder path>/*.eml     original message per file
+├─ pim/*.ics|.vcf|.json        calendar / contacts / tasks / notes (with --pim)
+├─ mailbox.mbox                optional, made by tools/build_mbox.py
 ├─ index.csv                   folder, server id, date, from, subject, size, path
 ├─ state.json                  resume state (sync keys, exported ids, policy key)
 ├─ report.md                   per-folder summary and failure list
@@ -203,6 +243,11 @@ name or GitHub handle before publishing.
   会记进失败清单并在报告里列出，不会静默丢弃。
 * **自带核查**：导出结束后重新同步一遍确认没有遗漏；`tools/verify_export.py` 会逐封
   重新读取 `.eml`，检查头部、重复与索引一致性。
+* **日历/联系人/任务/便笺**：加 `--pim`（GUI 里勾选对应选项）后一并导出——日历与任务输出
+  ICS、联系人输出 vCard、便笺输出 JSON。Zimbra 用服务器原生格式；ActiveSync 则由工具做
+  常见字段映射，并把原始属性另存为 `.raw.json`，不会丢信息。
+* **生成 mbox**：`tools/build_mbox.py` 把导出的 `.eml` 合并成一个 mbox（或每个文件夹一个），
+  便于整箱导入其他邮件客户端。
 
 ### 环境要求
 
@@ -228,7 +273,33 @@ python cli.py --url https://mail.example.com ^
 `--probe` 只列文件夹、不下载邮件；去掉它就是正式导出。常用参数：
 `--backend auto|eas|zimbra`（默认 auto）、`--only 收件箱`（只导某个文件夹）、
 `--zimbra-folder "Projects/2026"`（补充 Zimbra 文件夹）、`--window-size 100`、
-`--no-verify`、`--insecure`、`--verbose`。
+`--pim`（同时导出日历/联系人/任务/便笺）、`--no-verify`、`--insecure`、`--verbose`。
+
+### 导出日历、联系人、任务、便笺
+
+加上 `--pim`（GUI 里勾选对应复选框）就会把这些非邮件文件夹也导出，统一放在 `pim/`：
+
+| 文件夹类型 | 输出 | 说明 |
+| --- | --- | --- |
+| 日历 | `<名称>.ics` | VEVENT；全天事件用 `VALUE=DATE` |
+| 任务 | `<名称>.ics` | VTODO，含状态/优先级/截止时间 |
+| 联系人 | `<名称>.vcf` | vCard 3.0（姓名、单位、职务、邮箱、电话、地址、生日、备注） |
+| 便笺 / 日记 | `<名称>.json` | 原始属性 JSON |
+
+Zimbra 通道直接用服务器原生格式（`?fmt=ics|vcf|json`）原样保存；ActiveSync 通道由工具做
+常见字段映射，并把未经处理的原始属性写成同名 `.raw.json`，所以即使某个字段没被映射也不会丢。
+重复规则会转换常见类型（每天/每周/每月/每年），少见的类型保留在原始 JSON 里。
+
+### 导入到其他邮件客户端
+
+```powershell
+python tools\build_mbox.py --out "D:\mail-export"                 # 生成 mailbox.mbox
+python tools\build_mbox.py --out "D:\mail-export" --per-folder    # 每个文件夹再单独一个
+```
+
+mbox 是按字节拼出来的（对正文里以 `From ` 开头的行做 mboxrd 转义），测试里会用 Python 标准库
+`mailbox` 模块读回来校验。Thunderbird 和 Apple Mail 可以直接导入 mbox；Windows 版 Outlook
+本身不支持 mbox，可以用 Thunderbird 打开后再转发/移动。单个 `.eml` 也能直接拖进大多数客户端。
 
 地址既可以填 ActiveSync 入口，也可以直接填网页邮箱地址——入口地址会自动推导出来。
 
@@ -258,6 +329,8 @@ Zimbra 通道会把每个邮件文件夹整包下载成 `tar.gz`（里面是一�
 ```
 <导出目录>/
 ├─ eml/<文件夹路径>/*.eml      每封邮件的原始 MIME
+├─ pim/*.ics|.vcf|.json        日历/联系人/任务/便笺（加 --pim 时生成）
+├─ mailbox.mbox                可选，由 tools/build_mbox.py 生成
 ├─ index.csv                  索引：文件夹、服务器 ID、时间、发件人、主题、大小、路径
 ├─ state.json                 断点续传状态（同步键、已导出条目、设备策略 key）
 ├─ report.md                  各文件夹汇总与失败清单
