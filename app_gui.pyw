@@ -316,25 +316,22 @@ class ExportApp(tk.Tk):
         self._attach_file_log(out_dir, prefix="probe")
         self._set_running(True)
         self.var_status.set("正在测试连接…")
+        # 先落一条日志，保证界面一定有反馈（也方便事后查日志文件）
+        logging.info(
+            "开始测试连接：%s（通道 %s，账号 %s）",
+            self.var_url.get().strip(),
+            self.var_backend.get(),
+            self.var_user.get().strip(),
+        )
         engine = create_engine(self._settings(out_dir), self.var_password.get(), progress=self._on_event)
 
         def work() -> None:
             try:
                 result = engine.probe()
-                count = None
-                if isinstance(result, tuple):
-                    count = len(result[0])
-                elif isinstance(result, list):
-                    count = len(result)
-                if count is None:
-                    self.events.put(("status", "测试完成"))
-                elif count == 0:
-                    self.events.put(("log", "WARNING", "探测完成：服务器返回 0 个文件夹，请把上面的日志发我排查"))
-                    self.events.put(("status", "测试完成：0 个文件夹"))
-                else:
-                    self.events.put(("log", "INFO", f"探测完成：共 {count} 个文件夹（详情见上方日志）"))
-                    self.events.put(("status", f"测试完成：{count} 个文件夹"))
+                count, names = self._probe_summary(result)
+                self.events.put(("probe_result", {"count": count, "names": names}))
             except Exception as exc:
+                logging.exception("测试连接失败")
                 self.events.put(("error", str(exc)))
             finally:
                 self.events.put(("idle", None))
@@ -393,6 +390,18 @@ class ExportApp(tk.Tk):
         self.cancel_event.set()
         self.var_status.set("正在停止…（会在当前条目结束后停下）")
 
+    @staticmethod
+    def _probe_summary(result) -> tuple[int, list[str]]:
+        """把不同通道的探测结果统一成 (数量, 名称列表)。"""
+        if isinstance(result, tuple) and len(result) == 2:  # EAS: (folders, paths)
+            folders, paths = result
+            names = [paths.get(getattr(folder, "server_id", ""), getattr(folder, "name", "")) for folder in folders]
+            return len(folders), names
+        if isinstance(result, list):
+            names = [getattr(item, "path", getattr(item, "name", str(item))) for item in result]
+            return len(result), names
+        return 0, []
+
     def _set_running(self, running: bool) -> None:
         self.is_running = running
         state = "disabled" if running else "normal"
@@ -409,30 +418,61 @@ class ExportApp(tk.Tk):
         try:
             while True:
                 kind, *payload = self.events.get_nowait()
-                if kind == "log":
-                    level, message = payload
-                    self.append_log(message, level)
-                elif kind == "progress":
-                    self.handle_progress(payload[0])
-                elif kind == "done":
-                    self.handle_done(payload[0])
-                elif kind == "cancelled":
-                    self.var_status.set("已中止（重跑可续传）")
-                    self.append_log("已中止。已导出的部分保留，重跑会从断点继续。", "WARNING")
-                elif kind == "error":
-                    self.var_status.set("出错")
-                    # 走 logging 而不是直接写控件：这样错误也会落到日志文件里
-                    logging.error("%s", payload[0])
-                    messagebox.showerror(APP_TITLE, payload[0])
-                elif kind == "status":
-                    self.var_status.set(payload[0])
-                elif kind == "idle":
-                    if self.is_running:
-                        self._set_running(False)
-                    self.bar_activity.stop()
+                # 单个事件处理出错不能拖垮整个事件循环——否则界面会变成
+                # "点了没反应、日志也不刷新"，而且 pythonw 下看不到任何报错。
+                try:
+                    self._handle_event(kind, payload)
+                except Exception:
+                    logging.exception("处理界面事件 %r 时出错", kind)
         except queue.Empty:
             pass
-        self.after(120, self._drain_events)
+        finally:
+            self.after(120, self._drain_events)
+
+    def _handle_event(self, kind: str, payload: list) -> None:
+        if kind == "log":
+            level, message = payload
+            self.append_log(message, level)
+        elif kind == "progress":
+            self.handle_progress(payload[0])
+        elif kind == "done":
+            self.handle_done(payload[0])
+        elif kind == "cancelled":
+            self.var_status.set("已中止（重跑可续传）")
+            self.append_log("已中止。已导出的部分保留，重跑会从断点继续。", "WARNING")
+        elif kind == "error":
+            self.var_status.set("出错")
+            # 走 logging 而不是直接写控件：这样错误也会落到日志文件里
+            logging.error("%s", payload[0])
+            messagebox.showerror(APP_TITLE, payload[0])
+        elif kind == "status":
+            self.var_status.set(payload[0])
+        elif kind == "probe_result":
+            self.handle_probe_result(payload[0])
+        elif kind == "idle":
+            if self.is_running:
+                self._set_running(False)
+            self.bar_activity.stop()
+
+    def handle_probe_result(self, info: dict) -> None:
+        """探测结束：日志 + 状态栏 + 弹窗，三处都给反馈。"""
+        count = info.get("count", 0)
+        names = info.get("names") or []
+        if count:
+            preview = "\n".join(f"  · {name}" for name in names[:20])
+            if len(names) > 20:
+                preview += f"\n  … 另有 {len(names) - 20} 个"
+            self.append_log(f"探测完成：共 {count} 个文件夹\n{preview}", "INFO")
+            self.var_status.set(f"测试完成：{count} 个文件夹")
+            messagebox.showinfo(APP_TITLE, f"连接成功，服务器返回 {count} 个文件夹：\n\n{preview}")
+        else:
+            self.append_log("探测完成：服务器返回 0 个文件夹（请把日志文件发我排查）", "WARNING")
+            self.var_status.set("测试完成：0 个文件夹")
+            messagebox.showwarning(
+                APP_TITLE,
+                "连接成功，但服务器返回 0 个文件夹。\n\n"
+                "请把导出目录下 logs\\probe-*.log 发我，里面有服务器返回的原始信息。",
+            )
 
     def handle_progress(self, event: dict) -> None:
         name = event.get("event")

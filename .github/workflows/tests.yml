@@ -44,3 +44,6 @@ jobs:
 
       - name: Zimbra channel and defensive diagnostics
         run: python tests/test_zimbra.py
+
+      - name: GUI smoke test (skips without a display)
+        run: python tests/test_gui.py
