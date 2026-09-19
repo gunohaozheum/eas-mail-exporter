@@ -47,3 +47,6 @@ jobs:
 
       - name: GUI smoke test (skips without a display)
         run: python tests/test_gui.py
+
+      - name: PIM export and mbox builder
+        run: python tests/test_pim_mbox.py
