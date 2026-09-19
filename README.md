@@ -34,7 +34,9 @@ stays open because phones rely on it.
   `auto` mode it tries ActiveSync first and switches to Zimbra when the server
   does not answer as an ActiveSync endpoint.
 * **Resumable** — per-folder sync keys are stored, so an interrupted run continues
-  where it stopped instead of re-downloading.
+  where it stopped instead of re-downloading. Before each folder it also compares
+  the recorded state with the files on disk: if you moved or deleted part of the
+  output, that folder is re-synced instead of being silently skipped.
 * **Faithful output** — asks the server for the full MIME source; per-item fallback
   fetch when a folder returns summaries only. Anything that still fails is listed
   in `state.json` and `report.md` instead of being dropped silently.
@@ -134,6 +136,10 @@ are handled explicitly, each with a regression test:
 | Empty HTTP 200 body means "no changes" on some servers | treat as an empty page instead of failing |
 | `<Data>` payloads are not always clean base64 | try raw MIME, length-prefixed, padded, control-byte variants |
 | `email.message_from_bytes` mangles raw UTF-8 headers | parse headers from bytes directly |
+| The provisioning step is answered with a web page (HTTP 449 + HTML) | reported as "not an ActiveSync response" instead of crashing; `auto` switches to Zimbra |
+| Policy key rejected with status `144` (InvalidPolicyKey) | re-runs the provisioning handshake automatically |
+| Zimbra wraps repeated JSON elements in arrays and prefixes paths with `USER_ROOT` | normalized, so REST URLs stay `/home/<mailbox>/<folder>` |
+| Exported files were moved or deleted behind the tool's back | state is compared with the files on disk and that folder is re-synced |
 
 The WBXML tag tables in `eas/wbtokens.py` are generated from the official
 [MS-ASWBXML] specification by `tools/fetch_ms-aswbxml_spec.py` + `tools/gen_wbtokens.py`.
@@ -149,6 +155,7 @@ python tests/test_responses.py   # response parsing for FolderSync/Sync/ItemOper
 python tests/test_headers.py     # RFC 2047 + raw UTF-8 header decoding
 python tests/test_engine.py      # file naming, folder paths, state and index
 python tests/test_zimbra.py      # Zimbra channel + non-EAS response diagnostics
+python tests/test_gui.py         # GUI smoke test (skips without a display)
 ```
 
 ### Build a standalone .exe (optional)
@@ -190,6 +197,8 @@ name or GitHub handle before publishing.
 * **两条通道**：Exchange ActiveSync（微软协议）与 Zimbra REST；`auto` 模式会先试
   ActiveSync，服务器没按 ActiveSync 应答时自动改走 Zimbra。
 * **断点续传**：每个文件夹记录服务器返回的同步键，中断后重跑会接着来，不重复下载。
+  每个文件夹开始前还会核对"状态记录"与"磁盘上实际的文件"：如果你把导出的部分文件
+  移走或删掉了，它会重新同步该文件夹，而不是当作已完成静默跳过。
 * **完整度高**：优先要求服务器内嵌完整 MIME；只给摘要的条目再单独补取；仍然拿不到的
   会记进失败清单并在报告里列出，不会静默丢弃。
 * **自带核查**：导出结束后重新同步一遍确认没有遗漏；`tools/verify_export.py` 会逐封
@@ -279,6 +288,10 @@ Zimbra 通道会把每个邮件文件夹整包下载成 `tar.gz`（里面是一�
 | 空文件夹时 Sync 返回 HTTP 200 + 空响应体 | 按"无变更"处理而不是报错 |
 | `<Data>` 内容不总是干净的 base64 | 依次尝试原始 MIME、带长度前缀、缺 `=`、带控制字节等形态 |
 | `email.message_from_bytes` 会把未编码的 UTF-8 邮件头解成乱码 | 直接按字节解析邮件头 |
+| 设备策略流程被服务器用网页回应（HTTP 449 + HTML） | 明确报成"不是 ActiveSync 响应"而不是崩溃；`auto` 模式自动改用 Zimbra |
+| 策略 key 失效，状态码 `144`（InvalidPolicyKey） | 自动重新走一遍设备策略握手 |
+| Zimbra 的 JSON 把重复元素包成数组、路径前缀是 `USER_ROOT` | 统一归一化，REST 地址保持 `/home/<邮箱>/<文件夹>` |
+| 导出文件被移走或删除，状态与磁盘脱节 | 核对状态与磁盘实际文件，自动重新同步该文件夹 |
 
 `eas/wbtokens.py` 里的字段表由 `tools/fetch_ms-aswbxml_spec.py` +
 `tools/gen_wbtokens.py` 从微软官方规范生成。
@@ -294,6 +307,7 @@ python tests/test_responses.py   # FolderSync / Sync / ItemOperations 响应解�
 python tests/test_headers.py     # RFC 2047 与原始 UTF-8 邮件头解码
 python tests/test_engine.py      # 文件名、文件夹路径、状态与索引
 python tests/test_zimbra.py      # Zimbra 通道 + 非 ActiveSync 响应的诊断
+python tests/test_gui.py         # GUI 冒烟测试（无图形环境时自动跳过）
 ```
 
 ### 打包成独立 exe（可选）
