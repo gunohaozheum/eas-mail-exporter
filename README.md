@@ -209,8 +209,10 @@ Windows: run `build_exe.bat` (installs PyInstaller and produces
 
 ### Limitations
 
-* Mail folders only. Calendar, contacts, tasks and notes are reported and skipped
-  (they cannot be represented as `.eml`).
+* By default only mail folders are exported; calendar, contacts, tasks and notes are
+  listed and skipped. Pass `--pim` (or tick the GUI checkbox) to export them too as
+  ICS / vCard / JSON. They are not written as `.eml` because those formats cannot
+  represent an appointment or a contact.
 * ActiveSync requires that mobile sync is enabled for the account; some tenants
   disable it or enforce MFA, in which case the request is rejected or answered
   with a web page. Use the Zimbra channel (or `auto`) in that case.
@@ -397,7 +399,9 @@ Windows 下运行 `build_exe.bat`，会自动安装 PyInstaller 并生成
 
 ### 已知限制
 
-* 只导出邮件文件夹；日历、联系人、任务、便笺会被识别并跳过（它们不适合用 `.eml` 表示）。
+* 默认只导出邮件文件夹；日历、联系人、任务、便笺会被识别并跳过。加 `--pim`（或在界面里
+  勾选对应选项）即可一并导出为 ICS / vCard / JSON。它们不会写成 `.eml`，因为这两种格式
+  本来就表示不了"一个日程"或"一个联系人"。
 * ActiveSync 需要账号已启用移动同步；若服务器关闭了它或强制二次验证，请求会被拒绝或返回网页，
   这种情况下改用 Zimbra 通道（或 `auto`）。
 * 首次连接会在邮箱里留下一条设备记录。
