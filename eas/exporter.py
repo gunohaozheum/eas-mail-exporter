@@ -384,6 +384,8 @@ class BaseExportEngine:
         target_dir.mkdir(parents=True, exist_ok=True)
         base = safe_name(folder_name, 60)
         path = target_dir / f"{base}{pim.EXTENSIONS[fmt]}"
+        if not props_list and self.keep_existing_pim(folder_name, path, "本次没有从服务器取到条目"):
+            return path
         content = pim.build(fmt, props_list, uids, kind)
         path.write_text(content, encoding="utf-8")
         raw_path = None
@@ -398,6 +400,22 @@ class BaseExportEngine:
             f"，原始属性见 {raw_path.name}" if raw_path else "",
         )
         return path
+
+    def keep_existing_pim(self, folder_name: str, path: Path, reason: str) -> bool:
+        """结果为 0 条时，别把已经写好的文件覆盖成空文件。
+
+        返回 True 表示"已保留旧文件、跳过本次写入"。
+        """
+        if path.exists() and path.stat().st_size > 0:
+            LOGGER.warning(
+                "%s：%s。为避免把已有文件覆盖成空的，保留 %s 不动"
+                "（如需强制重建，删掉该文件或 state.json 里 pim: 开头的对应记录即可）。",
+                folder_name,
+                reason,
+                path.name,
+            )
+            return True
+        return False
 
     def state_matches_disk(self, folder_path: str, entry: dict) -> bool:
         """检查 state 记录的"已导出"与磁盘上的文件是否对得上。
@@ -713,7 +731,10 @@ class ExportEngine(BaseExportEngine):
         fmt = pim.EAS_FOLDER_FORMATS[folder.type_code]
         kind = "tasks" if folder.type_code == 7 else "calendar"
         entry = self.state.folder(f"pim:{folder.server_id}", name=name, type_code=folder.type_code)
-        sync_key = entry.get("sync_key") or "0"
+        # 注意：这个文件夹最终会写成一个完整文件（例如整个日历一个 .ics），
+        # 所以必须每次都从 SyncKey=0 全量枚举；沿用上次的增量同步键会导致
+        # 第二次运行拿不到任何条目，进而把好文件覆盖成空文件。
+        sync_key = "0"
         LOGGER.info("→ %s（%s 格式，SyncKey=%s）", name, fmt.upper(), sync_key)
 
         props_list: list[dict] = []
@@ -749,7 +770,7 @@ class ExportEngine(BaseExportEngine):
                 uids.append(item.server_id)
                 new_items += 1
             sync_key = page.sync_key
-            entry["sync_key"] = sync_key
+            entry["last_sync_key"] = sync_key
             entry["count"] = len(props_list)
             self.state.save(self.client)
             if page.more_available:
@@ -1034,6 +1055,19 @@ class ZimbraExportEngine(BaseExportEngine):
         LOGGER.info("→ %s（%s 格式）", folder.path, fmt.upper())
         started = time.time()
         size = self.client.download_folder(folder.path, fmt, path)
+        if size == 0:
+            # 空文件夹（服务器返回 204）：文件根本没被创建，已有文件保持原样
+            if path.exists() and path.stat().st_size > 0:
+                self.keep_existing_pim(folder.path, path, "服务器返回空文件夹")
+            else:
+                LOGGER.info("  %s：空文件夹，没有内容可写", folder.path)
+            self.stats[folder.path] = {
+                "exported_total": 0, "exported_now": 0, "fetched_individually": 0,
+                "failed": 0, "seconds": round(time.time() - started, 1),
+                "format": fmt.upper(), "pim": True,
+            }
+            self._emit(event="folder_done", folder=folder.path, stats=self.stats[folder.path])
+            return
         entry["format"] = fmt
         entry["size"] = size
         self.state.save()

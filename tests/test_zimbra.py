@@ -522,7 +522,7 @@ def test_auto_falls_back_when_449_is_html() -> None:
 # ------------------------------------------------------------------ PIM 导出
 
 
-def _eas_pim_handler(method, url, body):
+def _eas_pim_handler(method, url, body, *, calendar_items: bool = True):
     folder_payload = wbxml.encode(
         E(
             FolderHierarchy.FolderSync,
@@ -557,6 +557,22 @@ def _eas_pim_handler(method, url, body):
                     AirSync.Collection,
                     E(AirSync.SyncKey, "1"),
                     E(AirSync.CollectionId, "11"),
+                    E(AirSync.Status, "1"),
+                    E(AirSync.Commands),
+                ),
+            ),
+        )
+    )
+    # 非 0 同步键时服务器回答"没有变更"——真实服务器就是这样，也是原 bug 的触发条件
+    empty_calendar_sync = wbxml.encode(
+        E(
+            AirSync.Sync,
+            E(
+                AirSync.Collections,
+                E(
+                    AirSync.Collection,
+                    E(AirSync.SyncKey, "1"),
+                    E(AirSync.CollectionId, "9"),
                     E(AirSync.Status, "1"),
                     E(AirSync.Commands),
                 ),
@@ -600,7 +616,10 @@ def _eas_pim_handler(method, url, body):
         node = wbxml.decode(body)
         collection = node.path("Collections", "Collection")
         if collection is not None and collection.text_of("CollectionId") == "9":
-            return HttpResponse(200, {}, calendar_sync)
+            key = collection.text_of("SyncKey")
+            if calendar_items and key == "0":
+                return HttpResponse(200, {}, calendar_sync)
+            return HttpResponse(200, {}, empty_calendar_sync)
         return HttpResponse(200, {}, empty_sync)
     return HttpResponse(404, {}, b"")
 
@@ -668,6 +687,77 @@ def test_zimbra_pim_downloads_native_format() -> None:
         # 邮件照常导出
         assert summary["exported"] == 4
     finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_eas_pim_rerun_keeps_full_file() -> None:
+    """回归：第二次导出不能把已经写好的日历/联系人文件覆盖成空文件。
+
+    原 bug：PIM 用了增量同步键，第二次运行服务器回答"没有变更"，
+    于是写出了一个空壳文件（VCALENDAR 里没有事件）。
+    """
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "pim-rerun"
+    settings = ExportSettings(
+        server_url="https://mail.example.com",
+        user="u@example.com",
+        out_dir=out_dir,
+        include_pim=True,
+    )
+    engine = create_engine(settings, "pw")
+    module = _install_fake_backends(_eas_pim_handler)
+    try:
+        engine.run()
+        ics = out_dir / "pim" / "日历.ics"
+        first = ics.read_text(encoding="utf-8")
+        assert "BEGIN:VEVENT" in first and "SUMMARY:家长会" in first
+
+        # 第二次导出（同一个目录、同一份 state）
+        engine2 = create_engine(settings, "pw")
+        engine2.run()
+        second = ics.read_text(encoding="utf-8")
+        assert "BEGIN:VEVENT" in second, "第二次导出把日历覆盖成空文件了"
+        assert "SUMMARY:家长会" in second
+        assert second == first
+        assert json.loads((out_dir / "pim" / "日历.raw.json").read_text(encoding="utf-8"))[0][
+            "properties"
+        ]["Subject"] == "家长会"
+    finally:
+        module.ExportEngine.client_factory = staticmethod(EasClient)
+        module.ZimbraExportEngine.client_factory = staticmethod(ZimbraClient)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def test_pim_empty_result_never_overwrites_existing_file() -> None:
+    """即使服务器这次真的返回 0 条，也不能把已有文件覆盖成空的。"""
+    tmp_dir = ROOT / ".tmp-test"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    out_dir = tmp_dir / "pim-guard"
+    settings = ExportSettings(
+        server_url="https://mail.example.com",
+        user="u@example.com",
+        out_dir=out_dir,
+        include_pim=True,
+    )
+    # 先放一个"之前成功导出"的文件
+    pim_dir = out_dir / "pim"
+    pim_dir.mkdir(parents=True)
+    good = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:重要会议\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    (pim_dir / "日历.ics").write_bytes(good.encode("utf-8"))
+
+    engine = create_engine(settings, "pw")
+    # 服务器一条都不返回（模拟异常/空结果）
+    module = _install_fake_backends(
+        lambda method, url, body: _eas_pim_handler(method, url, body, calendar_items=False)
+    )
+    try:
+        engine.run()
+        # 按字节比较：read_text 会把 \r\n 规范化成 \n，用字符串比较会误判
+        assert (pim_dir / "日历.ics").read_bytes() == good.encode("utf-8"), "旧文件被空结果覆盖了"
+    finally:
+        module.ExportEngine.client_factory = staticmethod(EasClient)
+        module.ZimbraExportEngine.client_factory = staticmethod(ZimbraClient)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -819,3 +909,7 @@ if __name__ == "__main__":
     print("EAS 日历 -> ICS       ✓")
     test_zimbra_pim_downloads_native_format()
     print("Zimbra 原生 ICS        ✓")
+    test_eas_pim_rerun_keeps_full_file()
+    print("PIM 重跑不覆盖         ✓")
+    test_pim_empty_result_never_overwrites_existing_file()
+    print("空结果不覆盖旧文件     ✓")

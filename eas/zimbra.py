@@ -361,4 +361,8 @@ class ZimbraClient:
                 raise ZimbraAuthError(f"下载 {folder_path} 时认证被拒（HTTP 401）") from exc
             if "HTTP 404" in message:
                 raise ZimbraFolderMissing(f"服务器上没有这个文件夹：{folder_path}") from exc
+            if "HTTP 204" in message:
+                # 204 No Content：文件夹是空的，没写任何文件，正常情况
+                LOGGER.info("%s：服务器返回 204，视为空文件夹", folder_path)
+                return 0
             raise ZimbraError(message) from exc
